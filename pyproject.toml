@@ -1,0 +1,7 @@
+[project]
+name = "thermopro-collector"
+version = "0.1.0"
+dependencies = [
+  "bleak",
+  "python-dotenv"
+]

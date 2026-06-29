@@ -1,0 +1,3 @@
+bleak
+psycopg2
+python-dotenv

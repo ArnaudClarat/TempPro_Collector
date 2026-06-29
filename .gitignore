@@ -1,0 +1,19 @@
+# Environnement
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+db.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Exported CSV
+*.csv
