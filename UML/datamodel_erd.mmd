@@ -1,0 +1,32 @@
+erDiagram
+    SENSORS {
+        int id PK
+        string ble_id UK
+        timestamp first_seen
+        timestamp last_seen
+    }
+
+    LOCATIONS {
+        int id PK
+        string name UK
+    }
+
+    SENSOR_ASSIGNMENTS {
+        int id PK
+        int sensor_id FK
+        int location_id FK
+        timestamp assigned_at
+        timestamp removed_at
+    }
+
+    MEASURES {
+        timestamp time PK
+        int sensor_id FK
+        float temperature
+        float humidity
+        int battery_raw
+    }
+
+    SENSORS ||--o{ SENSOR_ASSIGNMENTS : "is assigned to"
+    LOCATIONS ||--o{ SENSOR_ASSIGNMENTS : "receives"
+    SENSORS ||--o{ MEASURES : "generates"

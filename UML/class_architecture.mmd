@@ -1,0 +1,48 @@
+classDiagram
+    class BleScanner {
+        +Queue raw_data_queue
+        +callback(device, advertisement_data) void
+        +start_scanning() Task
+    }
+
+    class MeasureParser {
+        +Queue raw_data_queue
+        +Queue processed_data_queue
+        +decode_tp357(key, value) MeasureDTO
+        +process_loop() Task
+    }
+
+    class Deduplicator {
+        -dict last_state_cache
+        +is_duplicate(measure) boolean
+    }
+
+    class SensorRegistry {
+        -dict memory_mapping
+        +load_mapping_from_db() void
+        +get_sensor_id(ble_id) int
+        +get_all_sensors() list
+    }
+
+    class DatabaseBatcher {
+        +Queue processed_data_queue
+        -list buffer
+        -float last_insert_time
+        +add_to_buffer(measure) void
+        +flush_buffer() void
+        +insert_measures(batch) void
+    }
+
+    class Watchdog {
+        -float check_interval
+        +check_sensor_health() Task
+        +trigger_history_recovery(sensor_id) void
+    }
+
+    %% Relations and Data Flow
+    BleScanner --> MeasureParser : "pushes raw data to"
+    MeasureParser --> Deduplicator : "validates with"
+    MeasureParser --> SensorRegistry : "resolves IDs via"
+    MeasureParser --> DatabaseBatcher : "pushes filtered data to"
+    Watchdog --> SensorRegistry : "monitors timestamps from"
+    Watchdog --> DatabaseBatcher : "bypasses filter to push history to"

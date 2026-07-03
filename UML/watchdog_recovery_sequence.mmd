@@ -1,0 +1,28 @@
+sequenceDiagram
+    autonumber
+    participant WD as Watchdog (main.py)
+    participant Cache as RAM Cache (mapping.py)
+    participant Capteur as Capteur (BLE Client)
+    participant Batcher as DatabaseBatcher (db.py)
+
+    loop Toutes les 30 minutes
+        WD->>Cache: Demande les derniers timestamps des capteurs
+        Cache-->>WD: Liste des capteurs et leur "last_seen"
+        
+        alt Maintenant - last_seen > 30 minutes
+            Note over WD: Capteur considéré comme "Inactif"
+            WD->>Capteur: Connexion active BLE (Mode Client)
+            
+            Capteur-->>WD: Connexion établie
+            WD->>Capteur: Demande extraction historique (Dernières X heures)
+            Capteur-->>WD: Tableau de mesures propres (Intervalle 1 min)
+            WD->>Capteur: Déconnexion BLE (Libère le canal)
+            
+            loop Pour chaque mesure historique reçue
+                Note over WD: Associe le sensor_id
+                WD->>Batcher: Pousse directement dans la Queue (Entonnoir)
+            end
+        else Le capteur émet normalement
+            Note over WD: RAS, continue la surveillance
+        end
+    end

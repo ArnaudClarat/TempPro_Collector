@@ -1,0 +1,42 @@
+stateDiagram-v2
+    [*] --> Initialization : Container Start
+
+    state Initialization {
+        [*] --> ConnectDB : Establish PostgreSQL Connection
+        ConnectDB --> LoadRegistry : Fetch Sensors & Locations
+        LoadRegistry --> SyncWatchdog : Set Initial last_seen Timestamps
+    }
+
+    Initialization --> NormalOperation : Success
+
+    state NormalOperation {
+        [*] --> PassiveScanning : Start BleScanner
+        PassiveScanning --> DataBuffering : Measure Received
+        DataBuffering --> PassiveScanning : Buffer < MAX_BATCH_SIZE
+        DataBuffering --> DatabaseFlush : Buffer Full OR Timeout
+        DatabaseFlush --> PassiveScanning : Write Success
+    }
+
+    NormalOperation --> HistoryRecovery : Watchdog Alert (Sensor Inactive > 30m)
+    
+    state HistoryRecovery {
+        [*] --> StopScanner : Pause Passive Scanning
+        StopScanner --> ConnectSensor : Active BLE Connection (Client Mode)
+        ConnectSensor --> FetchData : Request Internals (1 min interval)
+        FetchData --> DisconnectSensor : Download Complete
+        DisconnectSensor --> StreamToFunnel : Push Historical Data to Batcher
+    }
+
+    HistoryRecovery --> NormalOperation : Recovery Finished / Resume Scan
+
+    NormalOperation --> ErrorHandling : DB Connection Lost / BLE Crash
+    HistoryRecovery --> ErrorHandling : Connection Timeout / Protocol Error
+
+    state ErrorHandling {
+        [*] --> LogError : Record Exception
+        LogError --> AttemptReconnect : Wait Retry Interval
+        AttemptReconnect --> SuccessCheck : Test Resource Availability
+    }
+
+    ErrorHandling --> Initialization : Success (Hard Reset)
+    ErrorHandling --> [*] : Fatal Error (Container Shutdown)

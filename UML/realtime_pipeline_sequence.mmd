@@ -1,0 +1,31 @@
+sequenceDiagram
+    autonumber
+    actor Sensor
+    participant Scanner as BleScanner (main.py)
+    participant Parser as MeasureParser (decoder.py)
+    participant Filter as Deduplicator (RAM Cache)
+    participant Batcher as DatabaseBatcher (db.py)
+    participant DB as PostgreSQL
+
+    loop Every 5-20 seconds
+        Sensor->>Scanner: Broadcast BLE Advertisement
+        Note over Scanner: Filter by name "TP357"
+        Scanner->>Parser: Push raw bytes into Queue 1
+        
+        Parser->>Parser: Decode payload (decode_tp357)
+        Parser->>Filter: Send standardized Measure object
+        
+        Filter->>Filter: Compare with last state in RAM
+        alt Value changed OR interval elapsed
+            Filter->>Batcher: Push into Queue 2 (Funnel)
+            Note over Batcher: Append measure to buffer
+        else Is close duplicate
+            Note over Filter: Drop measure (Skip)
+        end
+
+        alt Buffer size >= MAX_BATCH_SIZE OR Time >= INTERVAL
+            Batcher->>DB: INSERT INTO measures (Batch execution)
+            Batcher->>DB: UPDATE last_seen in SENSORS table
+            Note over Batcher: Clear buffer
+        end
+    end
