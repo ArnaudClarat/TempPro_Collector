@@ -18,10 +18,13 @@ classDiagram
     }
 
     class SensorRegistry {
-        -dict memory_mapping
-        +load_mapping_from_db() void
-        +get_sensor_id(ble_id) int
-        +get_all_sensors() list
+        -dict _mapping_cache
+        -Lock _lock_mapping
+        +load_mapping() dict
+        +get_sensor(ble_id) dict
+        +evict_sensor(ble_id) void
+        +flag_data_gap(ble_id, has_gap) void
+        +get_all_cached_sensors() dict
     }
 
     class DatabaseBatcher {

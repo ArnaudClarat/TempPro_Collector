@@ -1,0 +1,32 @@
+{
+    "folders": [
+        {
+            "path": ".",
+            "name": "ThermoPro Collector",
+            "folder_exclude_patterns": [
+                "__pycache__",
+                ".git",
+                ".venv"
+            ],
+            "file_exclude_patterns": [
+                "*.pyc",
+                "*.tmp",
+                ".env"
+            ]
+        }
+    ],
+    "settings": {
+        "tab_size": 4,
+        "translate_tabs_to_spaces": true,
+        "trim_trailing_white_space_on_save": true,
+        "ensure_newline_at_eof_on_save": true
+    },
+    "build_systems": [
+        {
+            "shell_cmd": ".venv\\Scripts\\python.exe -u collector/main.py",
+            "working_dir": "${project_path}",
+            "selector": "source.python",
+            "kill_signal": "SIGBREAK"
+        }
+    ]
+}

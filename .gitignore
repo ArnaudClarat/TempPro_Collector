@@ -6,7 +6,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-db.py
 
 # OS
 .DS_Store
@@ -17,3 +16,11 @@ Thumbs.db
 
 # Exported CSV
 *.csv
+
+# SQL
+*_dump.sql
+migration.sql
+temp.sql
+
+# Sublime Text
+*.sublime-workspace

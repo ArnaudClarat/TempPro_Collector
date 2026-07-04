@@ -1,3 +1,4 @@
-bleak
-psycopg2
-python-dotenv
+bleak>=0.21.0
+psycopg-pool>=3.2.0
+psycopg>=3.1.0
+python-dotenv>=1.0.0
