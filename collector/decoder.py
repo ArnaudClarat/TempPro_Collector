@@ -1,6 +1,8 @@
 import struct, asyncio
 from typing import Dict, Any
-import db, mapping
+
+import mapping
+from db import db_queue
 from logger import log_msg
 
 # Queue 1: Buffer that receives raw advertisement payloads from the BleScanner
@@ -36,12 +38,13 @@ async def decoder_worker() -> None:
             try:
                 # Decode the raw bytes into human-readable metrics
                 decoded = decode_tp357(packet['manufacturer_id'], packet['payload'])
+                decoded['ble_id'] = packet['ble_id']
                 
                 # LOG PIPELINE FUNNEL (Triggers perfectly in MOCK_INSERT and FULL_PRODUCTION)
-                log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {packet['ble_id']} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity_raw']}%")
+                log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {decoded['ble_id']} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity_raw']}%")
                 
                 # Next step: push 'decoded' to db_queue for insertion
-                # db_queue.put_nowait(decoded_packet)
+                db_queue.put_nowait(decoded)
                 
             except Exception as decode_error:
                 log_msg("ERROR", f"[DECODER] Failed to decode packet: {decode_error}")

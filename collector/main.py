@@ -51,6 +51,8 @@ async def watchdog_worker():
     if EXECUTION_MODE == "OFFLINE_SIMULATION":
         return
 
+    from mapping import _mapping_cache
+
     last_health_check = time.monotonic()
     recovery_executed_today = False
 
