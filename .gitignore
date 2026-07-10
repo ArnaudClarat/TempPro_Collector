@@ -20,7 +20,10 @@ Thumbs.db
 # SQL
 *_dump.sql
 migration.sql
-temp.sql
 
 # Sublime Text
 *.sublime-workspace
+
+# Other
+temp.*
+test.*
