@@ -138,7 +138,7 @@ class Watchdog:
             cached_sensors = await self.registry.get_all_cached_sensors()
             for ble_id, state in cached_sensors.items():
                 if time.monotonic() - state["last_seen_timestamp"] > 60:
-                    await registry.flag_data_gap(ble_id, True)
+                    await self.registry.flag_data_gap(ble_id, True)
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Heartbeat verification step failed: {e}")
@@ -154,7 +154,7 @@ class Watchdog:
                 if state.get("has_data_gap"):
                     yesterday = current_time.date() - timedelta(days=1)
                     await self._trigger_history_recovery(ble_id, yesterday)
-                    await registry.flag_data_gap(ble_id, False)
+                    await self.registry.flag_data_gap(ble_id, False)
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
