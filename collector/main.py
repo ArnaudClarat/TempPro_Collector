@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from bleak import BleakScanner
+from typing import Optional
 
 from config import EXECUTION_MODE
 from logger import log_msg
@@ -11,10 +12,10 @@ from db import DatabaseBatcher
 from mapping import SensorRegistry
 from watchdog import Watchdog
 
-watchdog = Watchdog()
-sensor_registry = SensorRegistry()
 database_batcher = DatabaseBatcher()
 measure_parser = MeasureParser()
+sensor_registry = SensorRegistry(database_batcher)
+watchdog = Watchdog(database_batcher, sensor_registry)
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -79,6 +80,8 @@ async def main():
     if EXECUTION_MODE != "OFFLINE_SIMULATION":
         await database_batcher.init_db()
         await sensor_registry.load_mapping()
+
+        measure_parser.database_queue = database_batcher.db_queue
 
         # Concurrently fire pipeline background processing threads
         db_worker_task = asyncio.create_task(database_batcher.db_worker())

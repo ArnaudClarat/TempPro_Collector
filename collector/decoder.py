@@ -2,12 +2,12 @@ import struct, asyncio
 from typing import Dict, Any
 
 import mapping
-from db import DatabaseBatcher
 from logger import log_msg
 
 class MeasureParser:
     def __init__(self):
         self.raw_data_queue: asyncio.Queue = asyncio.Queue()
+        self.database_queue: asyncio.Queue = None
 
     def decode_tp357(self, manufacturer_id: int, payload: bytes) -> Dict[str, Any]:
         """
@@ -29,7 +29,6 @@ class MeasureParser:
         and prepares them for the database funnel.
         """
         log_msg("INFO", "[DECODER] Asynchronous worker pipeline initialized.")
-        from main import database_batcher
 
         try:
             while True:
@@ -37,6 +36,7 @@ class MeasureParser:
                 packet = await self.raw_data_queue.get()
 
                 try:
+                    # Import for the queue
                     # Decode the raw bytes into human-readable metrics
                     decoded = self.decode_tp357(packet['manufacturer_id'], packet['payload'])
                     ble_id = packet['ble_id']
@@ -53,8 +53,7 @@ class MeasureParser:
                     log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {payload_out['ble_id']} | Temp: {payload_out['temperature']}°C | Hum: {payload_out['humidity_raw']}%")
 
                     # Next step: push 'decoded' to db_queue for insertion
-                    log_msg("DEBUG", f"[DECODER] Pushing to queue ID: {id(database_batcher.db_queue)}")
-                    await database_batcher.db_queue.put(payload_out)
+                    await self.database_queue.put(payload_out)
 
                 except Exception as e:
                     log_msg("ERROR", f"[DECODER] Failed to decode packet: {e}")

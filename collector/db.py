@@ -8,17 +8,18 @@ from config import EXECUTION_MODE, DB_INSERT_INTERVAL, DB_MAX_BATCH_SIZE
 
 class DatabaseBatcher:
     def __init__(self):
-        self.db_queue: asyncio.Queue = asyncio.Queue()
+        self.db_queue: Optional[asyncio.Queue] = None
         self.pool: Optional[AsyncConnectionPool] = None
 
     async def init_db(self) -> None:
         """
         Initializes the asynchronous PostgreSQL connection pool if required by the execution mode.
         """
-
+        self.db_queue = asyncio.Queue()
         if EXECUTION_MODE == "OFFLINE_SIMULATION":
             log_msg("Info", "[DATABASE] OFFLINE_SIMULATION active. Bypassing connection pool initialization.")
             return
+
 
         user = os.getenv("PG_USER")
         password = os.getenv("PG_PASSWORD")
@@ -56,6 +57,7 @@ class DatabaseBatcher:
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (time, sensor_id) DO NOTHING;
         """
+
         bindings_matrix = [
             (
                 m["time"],
@@ -69,17 +71,22 @@ class DatabaseBatcher:
 
         # Routing logic for simulation and partial tracking modes
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT", "SENSORS_ONLY"):
-            records_summary = ", ".join([f"[{m['ble_id']} (ID:{m['sensor_id']}) -> {m['temperature']}°C/{m['humidity_raw']}%]" for m in buffer])
-            log_msg("Info", f"[DB MOCK] Time: {buffer[0]['time'].strftime('%H:%M:%S')} | Executing batch insert of {len(buffer)} measures -> {records_summary}")
+            samples = [f"('{time.strftime('%Y-%m-%d %H:%M:%S')}', {s_id}, {temp}, {hum}, {bat})" for time, s_id, temp, hum, bat in bindings_matrix[:3]]
+            payload = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
+
+            # Inline interpolation replacing placeholders with compiled dataset visualization
+            mocked_sql = query.replace("(%s, %s, %s, %s, %s)", payload)
+            log_msg("Info", f"[DB MOCK] {mocked_sql}")
             return
 
         try:
-            async with pool.connection() as conn:
+            async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.executemany(query, bindings_matrix)
-            log_msg("Info", f"[DATABASE Info] Successfully flushed batch of {len(buffer)} measures to public.measures.")
+            log_msg("Info", f"[DATABASE] Successfully flushed batch of {len(buffer)} measures to public.measures.")
+
         except Exception as e:
-            log_msg("Info", f"[DATABASE ERROR] Batch measurement insertion sequence failed: {e}")
+            log_msg("Error", f"[DATABASE] Batch measurement insertion sequence failed: {e}")
             raise e
 
     async def insert_sensor(self, ble_id: str, mac_address: str) -> int:
@@ -99,6 +106,7 @@ class DatabaseBatcher:
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
             log_msg("INFO", f"[DB MOCK] Time: {buffer[0]['time'].strftime('%H:%M:%S')} | Executing aggregated insert")
             return int(time.time()) & 0xFFFF
+
         try:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
@@ -143,7 +151,7 @@ class DatabaseBatcher:
         Retrieves the latest measurement timestamp stored for each unique active sensor.
         Queries the underlying database partition and returns a mapping dictionary.
         """
-        if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
+        if EXECUTION_MODE == "OFFLINE_SIMULATION":
             # Simulated environment fallback: bypass structural SQL query execution
             return {}
 
@@ -224,7 +232,6 @@ class DatabaseBatcher:
                                 "battery_raw": avg_bat,
                                 "time": (now_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)) # Force-truncate metrics timestamp to minute-precision for optimal hypertable bucket alignments
                             })
-
                         if buffer:
                             await self.insert_measures(buffer)
 

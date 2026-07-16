@@ -4,11 +4,17 @@ from datetime import datetime, timezone
 from config import EXECUTION_MODE
 from logger import log_msg
 
+# import os, matplotlib
+# matplotlib.use('Agg')
+# from pytp357s.fetcher import process_devices
+
 class Watchdog:
-    def __init__(self):
+    def __init__(self, db, registry):
         self._last_health_check = time.monotonic()
         self._recovery_executed_today = False
         self._ble_active_lock = asyncio.Lock()
+        self.db = db
+        self.registry = registry
 
     async def start_worker(self) -> None:
         """
@@ -18,8 +24,11 @@ class Watchdog:
             log_msg("Info", "[WATCHDOG] Watchdog not running in offline simulation.")
             return
 
-        # 1. Startup individual data sync verification
-        await self._execute_startup_checkup()
+
+        log_msg("Info", "[WATCHDOG] Watchdog starting.")
+
+        # Startup individual data sync verification
+        await self._execute_startup_history_catchup()
 
         try:
             while True:
@@ -27,12 +36,12 @@ class Watchdog:
                 now_monotonic = time.monotonic()
                 now_datetime = datetime.now(timezone.utc)
 
-                # 2. Daytime monitoring checklist evaluation interval (30 min)
+                # Daytime monitoring checklist evaluation interval (30 min)
                 if now_monotonic - self._last_health_check >= 1800:
                     await self._evaluate_sensor_heartbeats()
                     self._last_health_check = now_monotonic
 
-                # 3. Nightly window processing clock evaluator
+                # Nightly window processing clock evaluator
                 if now_datetime.hour == 0 and now_datetime.minute == 15:
                     if not self._recovery_executed_today:
                         await self._process_nightly_recovery(now_datetime)
@@ -44,35 +53,92 @@ class Watchdog:
         except asyncio.CancelledError:
             raise
 
-    async def _execute_startup_checkup(self) -> None:
+    async def _execute_startup_history_catchup(self) -> None:
         """
-        Private startup check querying database milestones per active sensor profile.
+        Startup sequence recovering missing history data globally using pytp357s orchestration.
         """
-        from datetime import timedelta
-        from main import database_batcher, sensor_registry
-        log_msg("INFO", "[WATCHDOG] Initiating granulated startup checkup sequence per sensor...")
-        try:
-            last_sensor_times = await database_batcher.get_last_timestamps_per_sensor()
-            cached_sensors = await sensor_registry.get_all_cached_sensors()
-            now_datetime = datetime.now(timezone.utc)
+        from datetime import datetime, timezone
+        from pytp357s.fetcher import process_devices
 
-            for ble_id, state in cached_sensors.keys():
-                await self._trigger_history_recovery(ble_id)
-                await asyncio.sleep(1.0)
+        log_msg("INFO", "[WATCHDOG] Initiating global startup history catchup sequence...")
+        try:
+            last_sensor_times = await self.db.get_last_timestamps_per_sensor()
+            mapping = await self.registry.load_mapping()
+
+            # Filter active devices and map them using the key expected by the library
+            input_devices = {
+                ble_id: {"mac": meta["mac_address"]}
+                for ble_id, meta in mapping.items()
+                if meta.get("mac_address") and meta.get("location_name") != "Ernage"
+            }
+
+            if not input_devices:
+                log_msg("WARN", "[WATCHDOG] No valid active devices mapped for history recovery.")
+                return
+
+            # Dynamic depth calculation in minutes (safely handles None or empty dict from DB)
+            last_time = last_sensor_times.get(6) or next(iter(last_sensor_times.values()), None) if last_sensor_times else None
+
+            # Convert to hours or fallback to 7 days (168 hours) if pristine
+            delta_hours = (datetime.now(timezone.utc) - last_time.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if last_time else 168
+            minutes_to_fetch = max(1, int(delta_hours * 60))
+
+            log_msg("INFO", f"[WATCHDOG] Submitting {len(input_devices)} devices to pytp357s pipeline (Fetching past {minutes_to_fetch} minutes)...")
+
+            # Global hardware fetch execution
+            raw_responses = await process_devices(
+                devices=input_devices, live=False, db_path=None, incremental=False,
+                count=minutes_to_fetch, overlap=0, timeout=30.0, scan_timeout=5.0,
+                parallelism=1, force=False, max_fetch_count=0, verbose=False
+            )
+
+            # Guard clause: ensure the library response matrix is a valid iterable dictionary
+            if not isinstance(raw_responses, dict):
+                log_msg("WARN", "[WATCHDOG] Global pipeline returned an invalid non-iterable response.")
+                return
+
+            # Flush results directly to TimescaleDB
+            for ble_id, fetch_result in raw_responses.items():
+                tuple_list = fetch_result.data if (hasattr(fetch_result, "data") and fetch_result.data is not None) else []
+
+                if not tuple_list:
+                    log_msg("WARN", f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
+                    continue
+
+                sensor_db_id = mapping.get(ble_id, {}).get("sensor_db_id")
+
+                history_buffer = [
+                    {
+                        "time": dt.replace(second=0, microsecond=0, tzinfo=timezone.utc),
+                        "sensor_id": sensor_db_id,
+                        "ble_id": ble_id,
+                        "temperature": round(float(temp), 2),
+                        "humidity_raw": round(float(hum), 2),
+                        "battery_raw": 100
+                    }
+                    for dt, temp, hum in tuple_list
+                ]
+
+                if history_buffer:
+                    log_msg("INFO", f"[RECOVERY] Flushing {len(history_buffer)} minutes to DB for {ble_id}...")
+                    try:
+                        await self.db.insert_measures(history_buffer)
+                    except Exception as db_err:
+                        log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Startup sync evaluation collapsed: {e}")
+
 
     async def _evaluate_sensor_heartbeats(self) -> None:
         """
         Private periodic handler verifying live incoming peripheral signal freshness.
         """
         try:
-            from main import sensor_registry
-            cached_sensors = await sensor_registry.get_all_cached_sensors()
+            cached_sensors = await self.registry.get_all_cached_sensors()
             for ble_id, state in cached_sensors.items():
                 if time.monotonic() - state["last_seen_timestamp"] > 60:
-                    await sensor_registry.flag_data_gap(ble_id, True)
+                    await registry.flag_data_gap(ble_id, True)
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Heartbeat verification step failed: {e}")
@@ -82,84 +148,13 @@ class Watchdog:
         Private chronological task invoking targeted active dumps on standard data holes.
         """
         from datetime import timedelta
-        from main import sensor_registry
         try:
-            cached_sensors = await sensor_registry.get_all_cached_sensors()
+            cached_sensors = await self.registry.get_all_cached_sensors()
             for ble_id, state in cached_sensors.items():
                 if state.get("has_data_gap"):
                     yesterday = current_time.date() - timedelta(days=1)
                     await self._trigger_history_recovery(ble_id, yesterday)
-                    await sensor_registry.flag_data_gap(ble_id, False)
+                    await registry.flag_data_gap(ble_id, False)
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
-
-    async def _trigger_history_recovery(self, ble_id: str) -> None:
-        """
-        Private Routine: Connects via active GATT using tpy357 wrapper, extracts
-        the data logs block, and flushes missing records into TimescaleDB.
-        """
-        import main
-        import tpy357
-        from bleak import BleakScanner
-
-        cached_sensors = await main.sensor_registry.get_all_cached_sensors()
-        sensor_meta = cached_sensors.get(ble_id, {})
-        ble_address = sensor_meta.get("ble_address")
-        sensor_db_id = sensor_meta.get("sensor_db_id")
-
-        # Guard Clause: Enforce address existence (requires at least one passive advertisement packet captured before)
-        if not ble_address:
-            log_msg("WARN", f"[RECOVERY] Aborting history sync for {ble_id}. No physical hardware address mapped yet.")
-            return
-
-        # Enforce mutual exclusion to prevent concurrent active sessions on the same BLE dongle
-        async with self._ble_active_lock:
-            try:
-                log_msg("INFO", f"[RECOVERY] Locating peripheral hardware for {ble_id} ({ble_address})...")
-                device = await BleakScanner.find_device_by_address(ble_address, timeout=8.0)
-
-                if not device:
-                    log_msg("WARN", f"[RECOVERY] Sensor {ble_id} is currently unavailable or out of range.")
-                    return
-
-                log_msg("INFO", f"[RECOVERY] Active connection opened. Downloading minute-precision logs via tpy357...")
-                # Requesting 'day' mode since it fetches high-granularity minute-precision packets natively
-                raw_history_data = await asyncio.wait_for(
-                    tpy357.query_tp357(dev=device, mode="day"),
-                    timeout=45.0
-                )
-
-                if not raw_history_data:
-                    log_msg("INFO", f"[RECOVERY] Memory flash returned no logged events for sensor {ble_id}.")
-                    return
-
-                # Fetch milestones boundaries from public metrics tracking partitions
-                last_timestamps = await main.database_batcher.get_last_timestamps_per_sensor()
-                last_db_record_time = last_timestamps.get(sensor_db_id)
-
-                history_buffer = []
-                for record in raw_history_data:
-                    record_time = record["time"]
-                    if record_time.tzinfo is None:
-                        record_time = record_time.replace(tzinfo=timezone.utc)
-
-                    # Filter: Stream directly if table is empty or record is strictly newer than current milestone
-                    if last_db_record_time is None or record_time > last_db_record_time:
-                        history_buffer.append({
-                            "time": record_time.replace(second=0, microsecond=0),
-                            "sensor_id": sensor_db_id,
-                            "ble_id": ble_id,
-                            "temperature": round(record["temp"], 2),
-                            "humidity_raw": round(record["hum_rh"], 2),
-                            "battery_raw": 100  # Baseline tracking metric fallback
-                        })
-
-                if history_buffer:
-                    log_msg("INFO", f"[RECOVERY] Sync success: Found {len(history_buffer)} missing minutes for {ble_id}. Flushing to DB...")
-                    await main.database_batcher.insert_measures(history_buffer)
-                else:
-                    log_msg("INFO", f"[RECOVERY] Database for sensor {ble_id} is already synchronized with device storage.")
-
-            except Exception as e:
-                log_msg("ERROR", f"[RECOVERY ERROR] Active synchronization pipeline failed for device {ble_id}: {e}")
