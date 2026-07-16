@@ -4,10 +4,6 @@ from datetime import datetime, timezone
 from config import EXECUTION_MODE
 from logger import log_msg
 
-# import os, matplotlib
-# matplotlib.use('Agg')
-# from pytp357s.fetcher import process_devices
-
 class Watchdog:
     def __init__(self, db, registry):
         self._last_health_check = time.monotonic()
@@ -52,83 +48,6 @@ class Watchdog:
 
         except asyncio.CancelledError:
             raise
-
-    async def _execute_startup_history_catchup(self) -> None:
-        """
-        Startup sequence recovering missing history data globally using pytp357s orchestration.
-        """
-        from datetime import datetime, timezone
-        from pytp357s.fetcher import process_devices
-
-        log_msg("INFO", "[WATCHDOG] Initiating global startup history catchup sequence...")
-        try:
-            last_sensor_times = await self.db.get_last_timestamps_per_sensor()
-            mapping = await self.registry.load_mapping()
-
-            # Filter active devices and map them using the key expected by the library
-            input_devices = {
-                ble_id: {"mac": meta["mac_address"]}
-                for ble_id, meta in mapping.items()
-                if meta.get("mac_address") and meta.get("location_name") != "Ernage"
-            }
-
-            if not input_devices:
-                log_msg("WARN", "[WATCHDOG] No valid active devices mapped for history recovery.")
-                return
-
-            # Dynamic depth calculation in minutes (safely handles None or empty dict from DB)
-            last_time = last_sensor_times.get(6) or next(iter(last_sensor_times.values()), None) if last_sensor_times else None
-
-            # Convert to hours or fallback to 7 days (168 hours) if pristine
-            delta_hours = (datetime.now(timezone.utc) - last_time.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if last_time else 168
-            minutes_to_fetch = max(1, int(delta_hours * 60))
-
-            log_msg("INFO", f"[WATCHDOG] Submitting {len(input_devices)} devices to pytp357s pipeline (Fetching past {minutes_to_fetch} minutes)...")
-
-            # Global hardware fetch execution
-            raw_responses = await process_devices(
-                devices=input_devices, live=False, db_path=None, incremental=False,
-                count=minutes_to_fetch, overlap=0, timeout=30.0, scan_timeout=5.0,
-                parallelism=1, force=False, max_fetch_count=0, verbose=False
-            )
-
-            # Guard clause: ensure the library response matrix is a valid iterable dictionary
-            if not isinstance(raw_responses, dict):
-                log_msg("WARN", "[WATCHDOG] Global pipeline returned an invalid non-iterable response.")
-                return
-
-            # Flush results directly to TimescaleDB
-            for ble_id, fetch_result in raw_responses.items():
-                tuple_list = fetch_result.data if (hasattr(fetch_result, "data") and fetch_result.data is not None) else []
-
-                if not tuple_list:
-                    log_msg("WARN", f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
-                    continue
-
-                sensor_db_id = mapping.get(ble_id, {}).get("sensor_db_id")
-
-                history_buffer = [
-                    {
-                        "time": dt.replace(second=0, microsecond=0, tzinfo=timezone.utc),
-                        "sensor_id": sensor_db_id,
-                        "ble_id": ble_id,
-                        "temperature": round(float(temp), 2),
-                        "humidity_raw": round(float(hum), 2),
-                        "battery_raw": 100
-                    }
-                    for dt, temp, hum in tuple_list
-                ]
-
-                if history_buffer:
-                    log_msg("INFO", f"[RECOVERY] Flushing {len(history_buffer)} minutes to DB for {ble_id}...")
-                    try:
-                        await self.db.insert_measures(history_buffer)
-                    except Exception as db_err:
-                        log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
-
-        except Exception as e:
-            log_msg("ERROR", f"[WATCHDOG ERROR] Startup sync evaluation collapsed: {e}")
-
 
     async def _evaluate_sensor_heartbeats(self) -> None:
         """

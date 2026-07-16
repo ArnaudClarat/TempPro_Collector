@@ -27,3 +27,5 @@ migration.sql
 # Other
 temp.*
 test.*
+*.txt
+*.zip
