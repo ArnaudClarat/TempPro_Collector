@@ -11,6 +11,7 @@ class Watchdog:
         self._ble_active_lock = asyncio.Lock()
         self.db = db
         self.registry = registry
+        self.boxcode = 6459
 
     async def start_worker(self) -> None:
         """
@@ -26,6 +27,7 @@ class Watchdog:
         # Startup individual data sync verification
         last_sensor_times = await self.db.get_last_timestamps_per_sensor()
         await self._execute_startup_history_catchup(last_sensor_times)
+        await self._execute_irm_history_catchup(last_sensor_times.get(self.boxcode))
 
         try:
             while True:
@@ -77,6 +79,13 @@ class Watchdog:
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
+
+        try:
+            log_msg("INFO", "[IRM] Triggering scheduled daily fetch for Ernage...")
+            now_utc = datetime.now(timezone.utc)
+            await self._fetch_and_store_irm_data(start_dt=now_utc - timedelta(days=1), end_dt=now_utc)
+        except Exception as e:
+            log_msg("ERROR", f"[WATCHDOG ERROR] Nightly IRM external fetch failed: {e}")
 
     async def _execute_startup_history_catchup(self) -> None:
         """
@@ -163,3 +172,80 @@ class Watchdog:
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Startup sync evaluation collapsed: {e}")
 
+    async def _execute_irm_history_catchup(self, last_time: datetime) -> None:
+        """
+        Startup sequence recovering missing IRM historical data.
+        """
+        # Enforce UTC awareness for safe datetime arithmetic
+        lt_utc = last_time.replace(tzinfo=timezone.utc) if not last_time.tzinfo else last_time.astimezone(timezone.utc)
+
+        log_msg("INFO", "[IRM] Starting cold-start catchup for Ernage station...")
+        await self._fetch_and_store_irm_data(start_dt=lt_utc)
+
+    async def _fetch_and_store_irm_data(self, start_dt: datetime) -> None:
+        """
+        Executes asynchronous HTTP extraction from IRM servers, parses station records,
+        and flushes typed SensorMeasure structures to TimescaleDB.
+        """
+
+        import aiohttp
+        from models import SensorMeasure
+
+        current_start = start_dt
+        end_dt = datetime.now(timezone.utc)
+
+        try:
+            log_msg("INFO", "[IRM] Connecting to Ernage station...")
+            async with aiohttp.ClientSession() as session:
+                while current_start < end_dt:
+                    current_end = min(current_start + timedelta(days=3), end_dt)
+                    buffer = []
+
+                    async with session.get(
+                        "https://opendata.meteo.be/service/ows",
+                        params= {
+                            "service": "WFS",
+                            "version": "2.0.0",
+                            "request": "GetFeature",
+                            "typeNames": "aws:aws_10min",
+                            "outputFormat": "json",
+                            "propertyName": "timestamp,temp_dry_shelter_avg,humidity_rel_shelter_avg",
+                            "cql_filter": f"timestamp BETWEEN '{current_start.strftime('%Y-%m-%dT%H:%M:%S')}' AND '{current_end.strftime('%Y-%m-%dT%H:%M:%S')}' AND code = {self.boxcode}"
+                        },
+                        timeout=30
+                    ) as response:
+                        if response.status != 200:
+                            log_msg("ERROR", f"[IRM] Data server rejected request with status code: {response.status}")
+                            return
+
+                        # Core parsing iteration over the official IRM JSON matrix structure
+                        for r in (await response.json()).get("features", []):
+                            # Extract and localize the raw timestamp into an aware UTC datetime object
+                            p = r.get("properties", {})
+
+                            # Skip if any required weather metric or timestamp is missing
+                            if not p.get("timestamp") or p.get("temp_dry_shelter_avg") is None or p.get("humidity_rel_shelter_avg") is None:
+                                log_msg("WARN", f"[IRM] Skipping incomplete record. Payload: {p}")
+                                continue
+
+                            buffer.append(SensorMeasure(
+                                time=datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")),
+                                sensor_id=boxcode,
+                                ble_id="IRM_ERNAGE",
+                                temperature=round(float(p["temp_dry_shelter_avg"]), 1),
+                                humidity_raw=int(round(float(p["humidity_rel_shelter_avg"])))
+                            ))
+
+                        if buffer:
+                            log_msg("INFO", f"[IRM] Successfully parsed {len(buffer)} records. Flushing to database...")
+                            try:
+                                await self.db.insert_measures(buffer)
+                            except Exception as db_err:
+                                log_msg("WARN", f"[IRM] Non-blocking database insertion warning: {db_err}")
+                        else:
+                            log_msg("WARN", "[IRM] Sync sequence completed but zero valid station metrics were captured.")
+
+                    current_start = current_end
+
+        except Exception as network_error:
+            log_msg("ERROR", f"[IRM ERROR] Asynchronous network extraction sequence collapsed: {network_error}")
