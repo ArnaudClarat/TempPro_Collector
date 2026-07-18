@@ -151,11 +151,8 @@ class DatabaseBatcher:
         Retrieves the latest measurement timestamp stored for each unique active sensor.
         Queries the underlying database partition and returns a mapping dictionary.
         """
-        if EXECUTION_MODE == "OFFLINE_SIMULATION":
+        if EXECUTION_MODE == "OFFLINE_SIMULATION" or self.pool is None:
             # Simulated environment fallback: bypass structural SQL query execution
-            return {}
-
-        if self.pool is None:
             return {}
 
         query = "SELECT sensor_id, MAX(time) FROM public.measures GROUP BY sensor_id;"

@@ -1,5 +1,5 @@
 import time, asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import EXECUTION_MODE
 from logger import log_msg
@@ -24,7 +24,8 @@ class Watchdog:
         log_msg("Info", "[WATCHDOG] Watchdog starting.")
 
         # Startup individual data sync verification
-        await self._execute_startup_history_catchup()
+        last_sensor_times = await self.db.get_last_timestamps_per_sensor()
+        await self._execute_startup_history_catchup(last_sensor_times)
 
         try:
             while True:
@@ -66,7 +67,6 @@ class Watchdog:
         """
         Private chronological task invoking targeted active dumps on standard data holes.
         """
-        from datetime import timedelta
         try:
             cached_sensors = await self.registry.get_all_cached_sensors()
             for ble_id, state in cached_sensors.items():
@@ -84,7 +84,6 @@ class Watchdog:
         Uses explicit timezone translation to eliminate historical time-drift.
         """
         import os
-        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         from pytp357s.fetcher import process_devices
         from models import SensorMeasure
@@ -101,7 +100,7 @@ class Watchdog:
             devices = {
                 ble_id: {"mac": meta["mac_address"]}
                 for ble_id, meta in mapping.items()
-                if meta.get("mac_address") and meta.get("location_name") != "Ernage"
+                if meta.get("mac_address")
             }
 
             if not devices:
