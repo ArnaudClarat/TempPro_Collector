@@ -230,7 +230,7 @@ class Watchdog:
 
                             buffer.append(SensorMeasure(
                                 time=datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")),
-                                sensor_id=boxcode,
+                                sensor_id=self.boxcode,
                                 ble_id="IRM_ERNAGE",
                                 temperature=round(float(p["temp_dry_shelter_avg"]), 1),
                                 humidity_raw=int(round(float(p["humidity_rel_shelter_avg"])))
