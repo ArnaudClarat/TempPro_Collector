@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from logger import log_msg
 from config import EXECUTION_MODE, DB_INSERT_INTERVAL, DB_MAX_BATCH_SIZE
+from models import SensorMeasure
 
 class DatabaseBatcher:
     def __init__(self):
@@ -44,10 +45,10 @@ class DatabaseBatcher:
             self.pool = None
             log_msg("Info", "[DATABASE] Connection pool closed successfully.")
 
-    async def insert_measures(self, buffer: List[Dict[str, Any]]) -> None:
+    async def insert_measures(self, buffer: List[SensorMeasure]) -> None:
         """
-        Inserts a batch of measures into the database, or simulates the insertion
-        depending on the APP_EXECUTION_MODE value.
+        Inserts a batch of SensorMeasure objects into the database, or simulates
+        the insertion depending on the APP_EXECUTION_MODE value.
         """
         if not buffer:
             return
@@ -58,27 +59,26 @@ class DatabaseBatcher:
             ON CONFLICT (time, sensor_id) DO NOTHING;
         """
 
+        # Direct attribute access bypassing dictionary overhead
         bindings_matrix = [
             (
-                m["time"],
-                m["sensor_id"],
-                m["temperature"],
-                m["humidity_raw"],
-                m.get("battery_raw")
+                m.time,
+                m.sensor_id,
+                m.temperature,
+                m.humidity_raw,
+                m.battery_raw
             )
             for m in buffer
         ]
 
-        # Routing logic for simulation and partial tracking modes
+        # Routing logic for simulation and offline modes
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT", "SENSORS_ONLY"):
-            samples = [f"('{time.strftime('%Y-%m-%d %H:%M:%S')}', {s_id}, {temp}, {hum}, {bat})" for time, s_id, temp, hum, bat in bindings_matrix[:3]]
-            payload = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
-
-            # Inline interpolation replacing placeholders with compiled dataset visualization
-            mocked_sql = query.replace("(%s, %s, %s, %s, %s)", payload)
-            log_msg("Info", f"[DB MOCK] {mocked_sql}")
+            samples = [f"('{t.strftime('%Y-%m-%d %H:%M:%S')}', {s}, {temp}, {hum}, {bat})" for t, s, temp, hum, bat in bindings_matrix[:3]]
+            preview = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
+            log_msg("Info", f"[DB MOCK] Simulated query preview : {preview}")
             return
 
+        # Asynchronous batch flush optimized for psycopg3 pipelining
         try:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
@@ -181,7 +181,9 @@ class DatabaseBatcher:
         """
         log_msg("Info", "[DATABASE] Ingestion funnel background pipeline worker initializing.")
         from datetime import timedelta
-        buffer: List[Dict[str, Any]] = []
+        from models import SensorMeasure
+
+        buffer: List[SensorMeasure] = []
         minute_accumulator: Dict[str, Dict[str, List[float]]] = {}
         current_minute = datetime.now(timezone.utc).minute
 
@@ -197,15 +199,15 @@ class DatabaseBatcher:
                     data = None
 
                 if data:
-                    ble_id = data["ble_id"]
+                    ble_id = data.ble_id
 
                     # Dynamically provision sub-arrays if encountering a sensor for the first time during the current window
                     if ble_id not in minute_accumulator:
-                        minute_accumulator[ble_id] = {"temps": [], "hums": [], "bats": []}
+                        minute_accumulator[ble_id] = {"temps": [], "hums": [], "bats": [], "db_id": data.sensor_id}
 
-                    minute_accumulator[ble_id]["temps"].append(data["temperature"])
-                    minute_accumulator[ble_id]["hums"].append(data["humidity_raw"])
-                    minute_accumulator[ble_id]["bats"].append(data["battery_raw"])
+                    minute_accumulator[ble_id]["temps"].append(data.temperature)
+                    minute_accumulator[ble_id]["hums"].append(data.humidity_raw)
+                    minute_accumulator[ble_id]["bats"].append(data.battery_raw)
 
                 # Absolute trigger condition: time reaches the 00-second mark of a new minute
                 now_dt = datetime.now(timezone.utc)
@@ -224,14 +226,15 @@ class DatabaseBatcher:
                             avg_bat = round(sum(metrics["bats"]) / len(metrics["bats"]), 2)
                             sensor_info = await sensor_registry.get_sensor(ble_id)
 
-                            buffer.append({
-                                "ble_id": ble_id,
-                                "sensor_id": sensor_info["sensor_db_id"],
-                                "temperature": avg_temp,
-                                "humidity_raw": avg_hum,
-                                "battery_raw": avg_bat,
-                                "time": (now_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)) # Force-truncate metrics timestamp to minute-precision for optimal hypertable bucket alignments
-                            })
+                            # Instantiating the typed dataclass object directly inside the buffer
+                            buffer.append(SensorMeasure(
+                                ble_id=ble_id,
+                                sensor_id=sensor_info.sensor_db_id,
+                                temperature=avg_temp,
+                                humidity_raw=avg_hum,
+                                battery_raw=int(avg_bat),
+                                time=(now_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)) # Force-truncate metrics timestamp to minute-precision for optimal hypertable bucket alignments
+                            ))
                         if buffer:
                             await self.insert_measures(buffer)
 
@@ -247,3 +250,4 @@ class DatabaseBatcher:
             raise
         except Exception as e:
             log_msg("Error", f"[DATABASE] Funnel worker pipeline crashed: {e}")
+

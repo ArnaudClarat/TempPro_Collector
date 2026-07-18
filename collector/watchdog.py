@@ -77,3 +77,90 @@ class Watchdog:
 
         except Exception as e:
             log_msg("ERROR", f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
+
+    async def _execute_startup_history_catchup(self) -> None:
+        """
+        Startup sequence recovering missing history data globally using pytp357s orchestration.
+        Uses explicit timezone translation to eliminate historical time-drift.
+        """
+        import os
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        from pytp357s.fetcher import process_devices
+        from models import SensorMeasure
+
+        log_msg("INFO", "[WATCHDOG] Initiating global startup history catchup sequence...")
+
+        # Dynamic timezone extraction from system environment
+        local_tz = ZoneInfo(os.getenv("APP_TIMEZONE", "UTC"))
+
+        try:
+            last_times = await self.db.get_last_timestamps_per_sensor()
+            mapping = await self.registry.load_mapping()
+
+            devices = {
+                ble_id: {"mac": meta["mac_address"]}
+                for ble_id, meta in mapping.items()
+                if meta.get("mac_address") and meta.get("location_name") != "Ernage"
+            }
+
+            if not devices:
+                log_msg("WARN", "[WATCHDOG] No valid active devices mapped for history recovery.")
+                return
+
+            last_time = min(last_times.values()) if last_times else None
+
+            # Safe defensive delta calculation handling naive or aware database datetimes
+            if last_time:
+                last_time_utc = last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time.astimezone(timezone.utc)
+                diff_seconds = (datetime.now(timezone.utc) - last_time_utc).total_seconds()
+                minutes_to_fetch = max(1, int(diff_seconds / 60))
+            else:
+                minutes_to_fetch = 10080  # Default fallback: 7 days in minutes
+
+            log_msg("INFO", f"[WATCHDOG] Submitting pipeline to fetch past {minutes_to_fetch} minutes...")
+
+            raw_responses = await process_devices(
+                devices=devices, live=False, db_path=None, incremental=False,
+                count=minutes_to_fetch, overlap=0, timeout=30.0, scan_timeout=5.0,
+                parallelism=1, force=False, max_fetch_count=0, verbose=False
+            )
+
+            if not isinstance(raw_responses, dict):
+                log_msg("WARN", "[WATCHDOG] Global pipeline returned an invalid non-iterable response.")
+                return
+
+            # Flush results directly to TimescaleDB using object buffers
+            for ble_id, result in raw_responses.items():
+                records = result.data if (hasattr(result, "data") and result.data is not None) else []
+
+                if not records:
+                    log_msg("WARN", f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
+                    continue
+
+                sensor_db_id = mapping.get(ble_id, {}).get("sensor_db_id")
+                buffer: List[SensorMeasure] = []
+
+                for dt, temp, hum in records:
+                    # Anchor native naive datetime into local space, then translate to clean UTC
+                    utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz)
+
+                    buffer.append(SensorMeasure(
+                        time=utc_time,
+                        sensor_id=sensor_db_id,
+                        ble_id=ble_id,
+                        temperature=round(float(temp), 2),
+                        humidity_raw=round(float(hum), 2)
+                    ))
+
+                if buffer:
+                    log_msg("INFO", f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
+                    try:
+                        print(buffer)
+                        await self.db.insert_measures(buffer)
+                    except Exception as db_err:
+                        log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
+
+        except Exception as e:
+            log_msg("ERROR", f"[WATCHDOG ERROR] Startup sync evaluation collapsed: {e}")
+

@@ -2,6 +2,7 @@ import time, asyncio, json
 from typing import List, Dict, Any, Optional
 
 from logger import log_msg
+from models import SensorMetadata
 
 class SensorRegistry:
     _mapping_cache: Dict[str, Dict[str, Any]] = {}
@@ -70,7 +71,7 @@ class SensorRegistry:
         return SensorRegistry._mapping_cache
 
 
-    async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> dict:
+    async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> SensorMetadata:
         """
         Retrieves a sensor record from the RAM cache.
         If the device is unknown, it triggers an automated database registration
@@ -87,6 +88,7 @@ class SensorRegistry:
                     mapping_data[ble_id] = {
                         "sensor_db_id": sensor_db_id,
                         "mac_address": mac_address,
+                        "location_name": "Unknown",
                         "has_data_gap": False,
                         "last_seen_timestamp": time.monotonic()
                     }
@@ -100,7 +102,12 @@ class SensorRegistry:
                 if mac_address and not mapping_data[ble_id].get("mac_address"):
                     mapping_data[ble_id]["mac_address"] = mac_address
 
-        return mapping_data[ble_id]
+            raw_info = mapping_data[ble_id]
+            return SensorMetadata(
+                sensor_db_id=raw_info["sensor_db_id"],
+                mac_address=raw_info.get("mac_address", ""),
+                location_name=raw_info.get("location_name", "Unknown")
+            )
 
     async def evict_sensor(self, ble_id: str) -> None:
         """

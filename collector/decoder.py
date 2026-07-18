@@ -1,13 +1,14 @@
 import struct, asyncio
 from typing import Dict, Any
 
-import mapping
 from logger import log_msg
+from models import SensorMeasure
 
 class MeasureParser:
-    def __init__(self):
+    def __init__(self, registry):
         self.raw_data_queue: asyncio.Queue = asyncio.Queue()
         self.database_queue: asyncio.Queue = None
+        self.registry = registry
 
     def decode_tp357(self, manufacturer_id: int, payload: bytes) -> Dict[str, Any]:
         """
@@ -41,19 +42,22 @@ class MeasureParser:
                     decoded = self.decode_tp357(packet['manufacturer_id'], packet['payload'])
                     ble_id = packet['ble_id']
 
-                    payload_out = {
-                        "ble_id": ble_id,
-                        "temperature": decoded["temperature"],
-                        "humidity_raw": decoded["humidity_raw"],
-                        "battery_raw": decoded["battery_raw"],
-                        "time": packet["time"]
-                    }
+                    sensor_metadata = await self.registry.get_sensor(ble_id)
+                    sensor_db_id = sensor_metadata.sensor_db_id if sensor_metadata else 0
 
-                    # LOG PIPELINE FUNNEL (Triggers perfectly in MOCK_INSERT and FULL_PRODUCTION)
-                    log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {payload_out['ble_id']} | Temp: {payload_out['temperature']}°C | Hum: {payload_out['humidity_raw']}%")
+                    measure = SensorMeasure(
+                        time=packet["time"],
+                        sensor_id=sensor_db_id,
+                        ble_id=ble_id,
+                        temperature=round(float(decoded["temperature"]), 2),
+                        humidity_raw=round(float(decoded["humidity_raw"]), 2),
+                        battery_raw=decoded.get("battery_raw", 100)
+                    )
 
-                    # Next step: push 'decoded' to db_queue for insertion
-                    await self.database_queue.put(payload_out)
+                    log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {measure.ble_id} | Temp: {measure.temperature}°C | Hum: {measure.humidity_raw}%")
+
+                    if self.database_queue:
+                        await self.database_queue.put(measure)
 
                 except Exception as e:
                     log_msg("ERROR", f"[DECODER] Failed to decode packet: {e}")

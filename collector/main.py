@@ -11,10 +11,11 @@ from decoder import MeasureParser
 from db import DatabaseBatcher
 from mapping import SensorRegistry
 from watchdog import Watchdog
+from models import SensorMeasure
 
 database_batcher = DatabaseBatcher()
-measure_parser = MeasureParser()
 sensor_registry = SensorRegistry(database_batcher)
+measure_parser = MeasureParser(sensor_registry)
 watchdog = Watchdog(database_batcher, sensor_registry)
 
 if sys.platform == "win32":
@@ -30,7 +31,7 @@ class BleScanner:
         """
         # Quick guard clause: filter out any device that isn't a ThermoPro
         device_name = advertisement_data.local_name or ""
-        if "8AE3" not in device_name: #Replace by "TP357" when all tests are finished
+        if "TP357" not in device_name: #Replace by "8AE3" for test sensor only
             return
 
         # Extract manufacturer payload (skip empty background advertisements safely)
