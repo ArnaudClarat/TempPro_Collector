@@ -29,9 +29,8 @@ class BleScanner:
         """
         Filters incoming BLE advertisements from ThermoPro sensors and processes payloads.
         """
-        # Quick guard clause: filter out any device that isn't a ThermoPro
-        device_name = advertisement_data.local_name or ""
-        if "TP357" not in device_name: #Replace by "8AE3" for test sensor only
+        # Quick guard clause: filter out any device that isn't a ThermoPro 357S
+        if "TP357S" not in (device.name or ""): #Replace by "8AE3" for test sensor onlyh
             return
 
         # Extract manufacturer payload (skip empty background advertisements safely)
@@ -39,7 +38,7 @@ class BleScanner:
             arrival_time = datetime.now(timezone.utc)
 
             # Robust ID extraction: use MAC address suffix if name split fails
-            ble_id = device_name.split("(")[-1].replace(")", "") if "(" in device_name else device.address[-4:].replace(":", "")
+            ble_id = device.name.split("(")[-1].replace(")", "") if "(" in device.name else device.address[-4:].replace(":", "")
 
             if EXECUTION_MODE == "OFFLINE_SIMULATION":
                 # Direct streaming to stdout for standalone local validation
@@ -71,6 +70,7 @@ async def main():
     Main pipeline entrypoint provisioning pools and background streaming threads.
     Features an auto-restart loop to bypass Windows 11 hardware scanning timeout constraints.
     """
+
     log_msg("Info", f"Active mode : [{EXECUTION_MODE}] (Ctrl+C to terminate)")
 
     db_worker_task = None

@@ -41,22 +41,29 @@ class SensorRegistry:
                             s.mac_address AS mac_address,
                             l.id AS location_id,
                             l.name AS location_name,
-                            sa.assigned_at
-                        FROM public.sensors s
-                        JOIN public.sensor_assignments sa ON s.id = sa.sensor_id
-                        JOIN public.locations l ON sa.location_id = l.id
+                            sa.assigned_at,
+                            sa.removed_at
+                        FROM sensors s
+                        JOIN sensor_assignments sa ON s.id = sa.sensor_id
+                        JOIN locations l ON sa.location_id = l.id
                         WHERE sa.removed_at IS NULL;
                         """
                     )
                     rows = await cur.fetchall()
 
-                    for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at in rows:
+                    SensorRegistry._mapping_cache = {}
+
+                    for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
+                        if ble_id not in SensorRegistry._mapping_cache:
+                            SensorRegistry._mapping_cache[ble_id] = []
+
                         SensorRegistry._mapping_cache[ble_id] = {
                             "sensor_db_id": sensor_db_id,
                             "mac_address": mac_address,
                             "location_id": location_id,
                             "location_name": location_name,
                             "assigned_at": assigned_at,
+                            "removed_at": removed_at,
                             "has_data_gap": False,
                             "last_seen_timestamp": time.monotonic()
                         }
