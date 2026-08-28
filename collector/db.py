@@ -45,7 +45,7 @@ class DatabaseBatcher:
             self.pool = None
             log_msg("Info", "[DATABASE] Connection pool closed successfully.")
 
-    async def _insert_measures(self, buffer: List[SensorMeasure]) -> None:
+    async def insert_measures(self, buffer: List[SensorMeasure]) -> None:
         """
         Inserts a batch of SensorMeasure objects into the database, or simulates
         the insertion depending on the APP_EXECUTION_MODE value.
@@ -233,7 +233,7 @@ class DatabaseBatcher:
                                 time=(now_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)) # Force-truncate metrics timestamp to minute-precision for optimal hypertable bucket alignments
                             ))
                         if buffer:
-                            await self._insert_measures(buffer)
+                            await self.insert_measures(buffer)
 
                         minute_accumulator.clear()
 
@@ -242,7 +242,7 @@ class DatabaseBatcher:
         except asyncio.CancelledError:
             if buffer:
                 log_msg("Info", f"[DATABASE] System shutdown signal intercepted. Initiating final data flush of {len(buffer)} measures...")
-                await self._insert_measures(buffer)
+                await self.insert_measures(buffer)
             log_msg("Info", "[DATABASE] Ingestion funnel worker offline.")
             raise
         except Exception as e:
