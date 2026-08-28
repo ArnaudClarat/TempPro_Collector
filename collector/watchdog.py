@@ -163,7 +163,6 @@ class Watchdog:
                 if buffer:
                     log_msg("INFO", f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
                     try:
-                        print("buffer")
                         await self.db.insert_measures(buffer)
                     except Exception as db_err:
                         log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
