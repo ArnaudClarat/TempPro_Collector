@@ -171,7 +171,7 @@ class Watchdog:
                         log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
 
         except Exception as e:
-            log_msg("ERROR", f"[WATCHDOG ERROR] Startup sync evaluation collapsed: {e}")
+            log_msg("ERROR", f"[RECOVERY ERROR] Startup sync evaluation collapsed: {e}")
 
     async def _execute_irm_history_catchup(self, last_time: datetime) -> None:
         """
