@@ -21,14 +21,12 @@ class Watchdog:
             log_msg("Info", "[WATCHDOG] Watchdog not running in offline simulation.")
             return
 
-
         log_msg("Info", "[WATCHDOG] Watchdog starting.")
 
         # Startup individual data sync verification
         last_sensor_times = await self.db.get_last_timestamps_per_sensor()
         await self._execute_startup_history_catchup(last_sensor_times)
         await self._execute_irm_history_catchup(last_sensor_times.get(self.boxcode))
-
         try:
             while True:
                 await asyncio.sleep(1.0)
@@ -93,6 +91,7 @@ class Watchdog:
         Uses explicit timezone translation to eliminate historical time-drift.
         """
         import os
+        from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         from pytp357s.fetcher import process_devices
         from models import SensorMeasure
@@ -104,54 +103,58 @@ class Watchdog:
 
         try:
             mapping = await self.registry.load_mapping()
+            now_utc = datetime.now(timezone.utc)
 
-            devices = {
-                ble_id: {"mac": meta["mac_address"]}
-                for ble_id, meta in mapping.items()
-                if meta.get("mac_address")
-            }
+            for ble_id, meta in mapping.items():
+                mac = meta.get("mac_address")
+                sensor_db_id = meta.get("sensor_db_id")
 
-            if not devices:
-                log_msg("WARN", "[WATCHDOG] No valid active devices mapped for history recovery.")
-                return
+                if not mac:
+                    log_msg("WARN", f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
+                    continue
 
-            last_time = min(last_times.values()) if last_times else None
+                sensor_last_time = last_times.get(sensor_db_id)
+                if sensor_last_time:
+                    last_utc = sensor_last_time.replace(tzinfo=timezone.utc) if sensor_last_time.tzinfo is None else sensor_last_time.astimezone(timezone.utc)
+                    diff_seconds = (now_utc - last_utc).total_seconds()
+                    minutes_to_fetch = max(1, int(diff_seconds / 60))
+                else:
+                    log_msg("WARN", f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
+                    continue
 
-            # Safe defensive delta calculation handling naive or aware database datetimes
-            if last_time:
-                last_time_utc = last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time.astimezone(timezone.utc)
-                diff_seconds = (datetime.now(timezone.utc) - last_time_utc).total_seconds()
-                minutes_to_fetch = max(1, int(diff_seconds / 60))
-            else:
-                minutes_to_fetch = 10080  # Default fallback: 7 days in minutes
+                device = {ble_id: {"mac": mac}}
 
-            log_msg("INFO", f"[WATCHDOG] Submitting pipeline to fetch past {minutes_to_fetch} minutes...")
+                log_msg("INFO", f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
 
-            raw_responses = await process_devices(
-                devices=devices, live=False, db_path=None, incremental=False,
-                count=minutes_to_fetch, overlap=0, timeout=30.0, scan_timeout=5.0,
-                parallelism=1, force=False, max_fetch_count=0, verbose=False
-            )
+                timeout = 30.0
+                try:
+                    raw_responses = await process_devices(
+                        devices=device, live=False, db_path=None, incremental=False,
+                        count=minutes_to_fetch, overlap=0, timeout=timeout, scan_timeout=5.0,
+                        parallelism=1, force=False, max_fetch_count=0, verbose=False
+                    )
+                except Exception as fetch_err:
+                    log_msg("WARN", f"[RECOVERY] Sensor {ble_id} link dropped or unreachable: {fetch_err}")
+                    continue
 
-            if not isinstance(raw_responses, dict):
-                log_msg("WARN", "[WATCHDOG] Global pipeline returned an invalid non-iterable response.")
-                return
 
-            # Flush results directly to TimescaleDB using object buffers
-            for ble_id, result in raw_responses.items():
+                result = raw_responses.get(ble_id) if isinstance(raw_responses, dict) else None
+
+                if not result or getattr(result, "status", "error") == "error":
+                    reason = getattr(result, "message", "Timeout/No response received.")
+                    log_msg("WARN", f"[RECOVERY] Skipping {ble_id} (Unreachable or out of range after {timeout}s. Reason: {reason})")
+                    continue
+
                 records = result.data if (hasattr(result, "data") and result.data is not None) else []
-
                 if not records:
                     log_msg("WARN", f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
                     continue
 
-                sensor_db_id = mapping.get(ble_id, {}).get("sensor_db_id")
-                buffer: List[SensorMeasure] = []
 
+
+                buffer: list[SensorMeasure] = []
                 for dt, temp, hum in records:
-                    # Anchor native naive datetime into local space, then translate to clean UTC
-                    utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz)
-
+                    utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz).astimezone(timezone.utc)
                     buffer.append(SensorMeasure(
                         time=utc_time,
                         sensor_id=sensor_db_id,
