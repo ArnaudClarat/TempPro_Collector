@@ -3,7 +3,7 @@ ThermoPro Historical CSV Importer
 Automates memory-bounded historical backfills directly into TimescaleDB partitions.
 """
 
-import asyncio, csv, logging, os, sys
+import asyncio, csv, logging, os, sys, shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,10 +18,11 @@ from models import SensorMeasure
 
 CSV_ENCODING, CSV_COLUMNS, BATCH_SIZE = "utf-8-sig", 4, 5000
 LOCAL_TIMEZONE = ZoneInfo("Europe/Brussels")
+IMPORT_DIR = PROJECT_ROOT / "import"
+ARCHIVE_DIR = PROJECT_ROOT / "archive"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("thermopro-importer")
-IMPORT_DIR = PROJECT_ROOT / "import"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("csv-importer")
@@ -78,17 +79,17 @@ def parse_csv(file_path: Path, ble_id: str, sensor_id: int):
                 rows_skipped += 1
                 continue
 
+            raw_date = row[0].replace("\ufeff", "").strip()
+            raw_time = row[1].replace("\ufeff", "").strip()
+            raw_temperature = row[2].strip()
+            raw_humidity = row[3].strip()
+
+            # Checks for empty lines
+            if raw_temperature == "-" or raw_humidity == "-":
+                rows_skipped += 1
+                continue
+
             try:
-                raw_date = row[0].replace("\ufeff", "").strip()
-                raw_time = row[1].replace("\ufeff", "").strip()
-                raw_temperature = row[2].strip()
-                raw_humidity = row[3].strip()
-
-                # Checks for empty lines
-                if raw_temperature == "-" or raw_humidity == "-":
-                    rows_skipped += 1
-                    continue
-
                 # Enforce native timezone parsing to handle winter/summer offsets (CET/CEST) dynamically
                 local_dt = datetime.strptime(f"{raw_date} {raw_time}", "%d/%m/%Y %H:%M").replace(tzinfo=LOCAL_TIMEZONE)
                 rows_valid += 1
@@ -104,8 +105,31 @@ def parse_csv(file_path: Path, ble_id: str, sensor_id: int):
                 logger.warning("Parsing violation at line %d: %s", line_idx, exc)
                 rows_skipped += 1
 
-    logger.info("[STREAM SUMMARY] Evaluation complete. Valid: %d | Skipped: %d", rows_valid, rows_skipped)
+    logger.info("[IMPORTER] Evaluation complete. Valid: %d | Skipped: %d", rows_valid, rows_skipped)
 
+def prompt_file_action(file_path: Path) -> None:
+    """Interactively prompts the user to select the post-ingestion cleanup strategy."""
+    while True:
+        choice = input(
+            f"\n[ACTION REQUIRED] Choose a post-ingestion strategy for '{file_path.name}':\n"
+            f" [D]elete file\n"
+            f" [A]rchive file\n"
+            f" [L]eft it there\n"
+            f"Action (S/A/L): "
+        ).strip().upper()
+
+        if choice in ("D", "DELETE"):
+            file_path.unlink()
+            logger.info("Target file permanently deleted from storage.")
+            break
+        elif choice in ("A", "ARCHIVE"):
+            ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(file_path), str(ARCHIVE_DIR / file_path.name))
+            logger.info("Target file successfully relocated to archive directory.")
+            break
+        elif choice in ("L", "LEFT"):
+            logger.info("Target file left unmodified inside the import directory.")
+            break
 
 async def main() -> int:
     csv_files = list(IMPORT_DIR.glob("*.csv")) if IMPORT_DIR.is_dir() else []
@@ -113,33 +137,35 @@ async def main() -> int:
         logger.error("Data pipeline aborted: No target csv export logs found inside '%s'.", IMPORT_DIR)
         return 1
 
-    target_csv = csv_files[0]
     logger.info("Target operational context acquired: '%s'", target_csv.name)
 
     db = DatabaseBatcher()
     await db.init_db()
 
     try:
-        sensor_id, ble_id = await resolve_sensor_id_from_file(db, target_csv)
-        logger.info("DB Entity resolved -> Hardware Asset ID: %d (Signature: %s)", sensor_id, ble_id)
+        for target_csv in csv_files:
+            logger.info("Target file acquired: '%s'", target_csv.name)
+            try:
+                sensor_id, ble_id = await resolve_sensor_id_from_file(db, target_csv)
+                logger.info("DB Entity resolved -> Hardware Asset ID: %d (Signature: %s)", sensor_id, ble_id)
 
-        dataset = list(parse_csv(target_csv, ble_id=ble_id, sensor_id=sensor_id))
+                dataset = list(parse_csv(target_csv, ble_id=ble_id, sensor_id=sensor_id))
 
-        if not dataset:
-            logger.warning("Aucune donnée valide à importer.")
-            return 0
+                if not dataset:
+                    logger.warning("Aucune donnée valide à importer.")
+                    return 0
 
-        logger.info("Insertion unique de %d lignes dans TimescaleDB...", len(dataset))
-        await db.insert_measures(dataset)
+                logger.info("Insertion unique de %d lignes dans TimescaleDB...", len(dataset))
+                await db.insert_measures(dataset)
+                logger.info("Pipeline operations processed successfully.")
 
-        logger.info("Pipeline operations processed successfully.")
+                prompt_file_action(target_csv)
 
-        confirm = input(f"\n[CONFIRMATION] Proceed to permanently purge historical file '{target_csv.name}'? (y/N): ")
-        if confirm.strip().lower() in ("y", "yes"):
-            target_csv.unlink()
-            logger.info("Target file resource unlinked. File system storage clean.")
-        else:
-            logger.warning("File deletion skipped by user request.")
+            except Exception as file_exc:
+                logger.error("Processing sequence failed for file %s: %s", target_csv.name, file_exc)
+                continue
+
+        logger.info("Pipeline operations processed successfully. All imports completed.")
         return 0
 
     except Exception as exc:
