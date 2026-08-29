@@ -104,7 +104,7 @@ async def main():
     # Mount the BleakScanner context manager
     scanner = BleScanner()
     try:
-        #await scanner.start_scanning(stop_event)
+        await scanner.start_scanning(stop_event)
         await stop_event.wait()
 
     except KeyboardInterrupt:
