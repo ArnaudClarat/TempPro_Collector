@@ -1,7 +1,6 @@
-import time, asyncio, json
+import time, asyncio, json, logging
 from typing import List, Dict, Any, Optional
 
-from logger import log_msg
 from models import SensorMetadata
 
 class SensorRegistry:
@@ -27,7 +26,7 @@ class SensorRegistry:
             return SensorRegistry._mapping_cache
 
         if self.db.pool is None:
-            log_msg("WARN", "[MAPPING] Database pool uninitialized, skipping cache load.")
+            logging.warning("[MAPPING] Database pool uninitialized, skipping cache load.")
             return {}
 
         try:
@@ -54,9 +53,6 @@ class SensorRegistry:
                     SensorRegistry._mapping_cache = {}
 
                     for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
-                        if ble_id not in SensorRegistry._mapping_cache:
-                            SensorRegistry._mapping_cache[ble_id] = []
-
                         SensorRegistry._mapping_cache[ble_id] = {
                             "sensor_db_id": sensor_db_id,
                             "mac_address": mac_address,
@@ -68,11 +64,11 @@ class SensorRegistry:
                             "last_seen_timestamp": time.monotonic()
                         }
 
-                    log_msg("INFO", f"[MAPPING] Successfully cached {len(self._mapping_cache)} active sensors.")
-                    #log_msg("DEBUG", f"[MAPPING] List of cached sensors : {read_as_json(_mapping_cache)}")
+                    logging.info(f"[MAPPING] Successfully cached {len(SensorRegistry._mapping_cache)} active sensors.")
+                    logging.debug(f"[MAPPING] List of cached sensors : {SensorRegistry._read_as_json(SensorRegistry._mapping_cache)}")
 
         except Exception as e:
-            log_msg("ERROR", f"[MAPPING ERROR] Failed to load schema mapping from database: {e}")
+            logging.error(f"[MAPPING ERROR] Failed to load schema mapping from database: {e}")
             raise e
 
         return SensorRegistry._mapping_cache
@@ -88,7 +84,7 @@ class SensorRegistry:
             mapping_data = await self.load_mapping()
 
             if ble_id not in mapping_data:
-                log_msg("Warning", f"[MAPPING] Unknown sensor detected ({ble_id}). Initiating auto-registration...")
+                logging.warning(f"[MAPPING] Unknown sensor detected ({ble_id}). Initiating auto-registration...")
                 try:
                     sensor_db_id = await self.db.insert_sensor(ble_id, mac_address)
 
@@ -99,10 +95,10 @@ class SensorRegistry:
                         "has_data_gap": False,
                         "last_seen_timestamp": time.monotonic()
                     }
-                    log_msg("Warning", f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
+                    logging.warning("Warning", f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
 
                 except Exception as e:
-                    log_msg("Error", f"[MAPPING ERROR] Automated registration failed for device {ble_id}: {e}")
+                    logging.error(f"[MAPPING ERROR] Automated registration failed for device {ble_id}: {e}")
                     raise e
             else:
                 mapping_data[ble_id]["last_seen_timestamp"] = time.monotonic()
@@ -124,7 +120,7 @@ class SensorRegistry:
         async with SensorRegistry._lock_mapping:
             removed = SensorRegistry._mapping_cache.pop(ble_id, None)
             if removed:
-                log_msg("Warning", f"[MAPPING] Sensor {ble_id} (ID: {removed['sensor_db_id']}) evicted from cache.")
+                logging.warning(f"[MAPPING] Sensor {ble_id} (ID: {removed['sensor_db_id']}) evicted from cache.")
 
     async def flag_data_gap(self, ble_id: str, has_gap: bool) -> None:
         """

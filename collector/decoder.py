@@ -1,7 +1,6 @@
-import struct, asyncio
+import struct, asyncio, logging
 from typing import Dict, Any
 
-from logger import log_msg
 from models import SensorMeasure
 
 class MeasureParser:
@@ -29,7 +28,7 @@ class MeasureParser:
         Asynchronous worker that consumes raw BLE packets, decodes them,
         and prepares them for the database funnel.
         """
-        log_msg("INFO", "[DECODER] Asynchronous worker pipeline initialized.")
+        logging.info("[DECODER] Asynchronous worker pipeline initialized.")
 
         try:
             while True:
@@ -54,16 +53,16 @@ class MeasureParser:
                         battery_raw=decoded.get("battery_raw", 100)
                     )
 
-                    log_msg("INFO", f"[FUNNEL] Decoded data => Sensor: {measure.ble_id} | Temp: {measure.temperature}°C | Hum: {measure.humidity_raw}%")
+                    logging.info(f"[FUNNEL] Decoded data => Sensor: {measure.ble_id} | Temp: {measure.temperature}°C | Hum: {measure.humidity_raw}%")
 
                     if self.database_queue:
                         await self.database_queue.put(measure)
 
                 except Exception as e:
-                    log_msg("ERROR", f"[DECODER] Failed to decode packet: {e}")
+                    logging.error(f"[DECODER] Failed to decode packet: {e}")
                 finally:
                     self.raw_data_queue.task_done()
 
         except asyncio.CancelledError:
-            log_msg("Warning", "[DECODER] Worker pipeline shutdown signal received.")
+            logging.warning("[DECODER] Worker pipeline shutdown signal received.")
             raise
