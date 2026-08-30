@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from db import DatabaseBatcher
-from models import SensorMeasure
+from models import SensorMeasure, SensorMetadata
 
 CSV_ENCODING, CSV_COLUMNS, BATCH_SIZE = "utf-8-sig", 4, 5000
 LOCAL_TIMEZONE = ZoneInfo("Europe/Brussels")
@@ -27,12 +27,8 @@ logger = logging.getLogger("thermopro-importer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("csv-importer")
 
-async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> tuple[int, str]:
+async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> SensorMetadata:
     """Inspects the CSV metadata header to discover the location name and lookup its physical sensor ID."""
-    with file_path.open(mode="r", encoding=CSV_ENCODING) as f:
-        _ = next(f) # e.g., "Horodatage pour chaque échantillon de fréquence chaque 1 min"
-
-    # Sémantique de détection : Extrait "Test" à partir de "TempProSensor_Export_Test_27082026.csv"
     parts = file_path.stem.split("_")
     if len(parts) < 2:
         raise ValueError(f"Name format of CSV file is incorrect : {file_path.name}")
@@ -40,10 +36,9 @@ async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> t
 
     async with db.pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Query the temporal layer to find the physical hardware asset ID bound to this location name
             await cur.execute(
                 """
-                SELECT s.id, s.ble_id
+                SELECT s.id, s.mac_address
                 FROM locations l
                 JOIN sensor_assignments sa ON l.id = sa.location_id
                 JOIN sensors s ON sa.sensor_id = s.id
@@ -55,8 +50,13 @@ async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> t
             result = await cur.fetchone()
             if not result:
                 raise ValueError(f"No active hardware assignment mapping found for location '{location_name}' in DB.")
-            return result[0], result[1]
-
+            
+            # Retourne l'objet standard attendu par votre architecture
+            return SensorMetadata(
+                sensor_db_id=result[0],
+                mac_address=result[1],
+                location_name=location_name
+            )
 
 def parse_csv(file_path: Path, ble_id: str, sensor_id: int):
     """Yields parsed SensorMeasure objects sequentially to maintain a strict memory ceiling."""
@@ -137,8 +137,6 @@ async def main() -> int:
         logger.error("Data pipeline aborted: No target csv export logs found inside '%s'.", IMPORT_DIR)
         return 1
 
-    logger.info("Target operational context acquired: '%s'", target_csv.name)
-
     db = DatabaseBatcher()
     await db.init_db()
 
@@ -146,10 +144,10 @@ async def main() -> int:
         for target_csv in csv_files:
             logger.info("Target file acquired: '%s'", target_csv.name)
             try:
-                sensor_id, ble_id = await resolve_sensor_id_from_file(db, target_csv)
-                logger.info("DB Entity resolved -> Hardware Asset ID: %d (Signature: %s)", sensor_id, ble_id)
+                meta = await resolve_sensor_id_from_file(db, target_csv)
+                logger.info("DB Entity resolved -> Hardware Asset ID: %d (Location: %s)", meta.sensor_db_id, meta.location_name)
 
-                dataset = list(parse_csv(target_csv, ble_id=ble_id, sensor_id=sensor_id))
+                dataset = list(parse_csv(target_csv, ble_id=target_csv.stem.split("_")[0], sensor_id=meta.sensor_db_id))
 
                 if not dataset:
                     logger.warning("Aucune donnée valide à importer.")
