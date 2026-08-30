@@ -1,10 +1,9 @@
-import os, time, asyncio
+import os, time, asyncio, logging
 from typing import List, Dict, Any, Optional
 from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone
 
-from logger import log_msg
-from config import EXECUTION_MODE, DB_INSERT_INTERVAL, DB_MAX_BATCH_SIZE
+from config import EXECUTION_MODE
 from models import SensorMeasure
 
 class DatabaseBatcher:
@@ -18,7 +17,7 @@ class DatabaseBatcher:
         """
         self.db_queue = asyncio.Queue()
         if EXECUTION_MODE == "OFFLINE_SIMULATION":
-            log_msg("Info", "[DATABASE] OFFLINE_SIMULATION active. Bypassing connection pool initialization.")
+            logging.info("[DATABASE] OFFLINE_SIMULATION active. Bypassing connection pool initialization.")
             return
 
 
@@ -29,12 +28,12 @@ class DatabaseBatcher:
         name = os.getenv("PG_DB")
 
         url = f"postgresql://{user}:{password}@{host}:{port}/{name}"
-        log_msg("Info", f"[DATABASE] Initializing pool connection to: postgresql://{user}@{host}:{port}/{name}")
+        logging.info(f"[DATABASE] Initializing pool connection to: postgresql://{user}@{host}:{port}/{name}")
 
         self.pool = AsyncConnectionPool(conninfo=url, min_size=1, max_size=2, open=False)
         await self.pool.open()
         await self.pool.wait()
-        log_msg("Info", f"[DATABASE] Connected to TimescaleDB pool in [{EXECUTION_MODE}] mode.")
+        logging.info(f"[DATABASE] Connected to TimescaleDB pool in [{EXECUTION_MODE}] mode.")
 
     async def close_db(self) -> None:
         """
@@ -43,7 +42,7 @@ class DatabaseBatcher:
         if self.pool:
             await self.pool.close()
             self.pool = None
-            log_msg("Info", "[DATABASE] Connection pool closed successfully.")
+            logging.info("[DATABASE] Connection pool closed successfully.")
 
     async def insert_measures(self, buffer: List[SensorMeasure]) -> None:
         """
@@ -75,7 +74,7 @@ class DatabaseBatcher:
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT", "SENSORS_ONLY"):
             samples = [f"('{t.strftime('%Y-%m-%d %H:%M:%S')}', {s}, {temp}, {hum}, {bat})" for t, s, temp, hum, bat in bindings_matrix[:3]]
             preview = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
-            log_msg("Info", f"[DB MOCK] Simulated query preview : {preview}")
+            logging.info(f"[DB MOCK] Simulated query preview : {preview}")
             return
 
         # Asynchronous batch flush optimized for psycopg3 pipelining
@@ -83,10 +82,10 @@ class DatabaseBatcher:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.executemany(query, bindings_matrix)
-            log_msg("Info", f"[DATABASE] Successfully flushed batch of {len(buffer)} measures to measures.")
+            logging.info(f"[DATABASE] Successfully flushed batch of {len(buffer)} measures to measures.")
 
         except Exception as e:
-            log_msg("Error", f"[DATABASE] Batch measurement insertion sequence failed: {e}")
+            logging.error(f"[DATABASE] Batch measurement insertion sequence failed: {e}")
             raise e
 
     async def insert_sensor(self, ble_id: str, mac_address: str) -> int:
@@ -104,7 +103,7 @@ class DatabaseBatcher:
 
         # Routing logic for simulation and partial tracking modes
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
-            log_msg("INFO", f"[DB MOCK] Time: {buffer[0]['time'].strftime('%H:%M:%S')} | Executing aggregated insert")
+            logging.info(f"[DB MOCK] Time: {buffer[0]['time'].strftime('%H:%M:%S')} | Executing aggregated insert")
             return int(time.time()) & 0xFFFF
 
         try:
@@ -113,13 +112,13 @@ class DatabaseBatcher:
                     await cur.execute(query, bindings)
                     sensor_id = (await cur.fetchone())[0]
 
-            log_msg("Info", f"[DATABASE Info] Registered new hardware signature {ble_id} with database reference ID: {sensor_id}")
+            logging.info(f"[DATABASE Info] Registered new hardware signature {ble_id} with database reference ID: {sensor_id}")
             return sensor_id
         except Exception as e:
-            log_msg("Info", f"[DATABASE ERROR] Critical sensor hardware registration sequence aborted: {e}")
+            logging.info(f"[DATABASE ERROR] Critical sensor hardware registration sequence aborted: {e}")
             raise e
 
-    async def close_sensor_assignment(sensor_id: int) -> None:
+    async def close_sensor_assignment(self, sensor_id: int) -> None:
         """
         Updates the structural sensor assignments table to terminate a device room assignment.
         """
@@ -132,18 +131,18 @@ class DatabaseBatcher:
 
 
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
-            log_msg("Info", f"[DB SIMULATION - MODE: {EXECUTION_MODE}] Intercepted query execution simulation:")
-            log_msg("Info", f"  RAW TARGET QUERY -> {query.strip()}")
-            log_msg("Info", f"  CURSOR BINDINGS EXEC ARGS => {bindings}")
+            logging.info(f"[DB SIMULATION - MODE: {EXECUTION_MODE}] Intercepted query execution simulation:")
+            logging.info(f"  RAW TARGET QUERY -> {query.strip()}")
+            logging.info(f"  CURSOR BINDINGS EXEC ARGS => {bindings}")
             return
 
         try:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query, bindings)
-            log_msg("Info", f"[DATABASE] Closed active structural assignment record for sensor database reference: {sensor_id}")
+            logging.info(f"[DATABASE] Closed active structural assignment record for sensor database reference: {sensor_id}")
         except Exception as e:
-            log_msg("Error", f"[DATABASE] Failed to update and terminate active device tracking assignment: {e}")
+            logging.error(f"[DATABASE] Failed to update and terminate active device tracking assignment: {e}")
             raise e
 
     async def get_last_timestamps_per_sensor(self) -> Dict[int, datetime]:
@@ -168,7 +167,7 @@ class DatabaseBatcher:
                             # Enforce explicit UTC timezone alignment on native datetimes
                             timestamps[sensor_id] = last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time
         except Exception as e:
-            log_msg("ERROR", f"[DATABASE ERROR] Failed to fetch per-sensor historical boundaries: {e}")
+            logging.error(f"[DATABASE] Failed to fetch per-sensor historical boundaries: {e}")
 
         return timestamps
 
@@ -176,7 +175,7 @@ class DatabaseBatcher:
         """
         Continuous consumer background routine driving the centralized ingestion funnel (Queue 2).
         """
-        log_msg("Info", "[DATABASE] Ingestion funnel background pipeline worker initializing.")
+        logging.info("[DATABASE] Ingestion funnel background pipeline worker initializing.")
         from datetime import timedelta
         from models import SensorMeasure
 
@@ -188,7 +187,7 @@ class DatabaseBatcher:
             while True:
                 try:
                     # Non-blocking pull from ingestion queue with a 1-second heartbeat timeout
-                    log_msg("DEBUG", f"[DB WORKER] Listening to queue ID: {id(self.db_queue)} | Current size: {self.db_queue.qsize()}")
+                    logging.debug(f"[DB WORKER] Listening to queue ID: {id(self.db_queue)} | Current size: {self.db_queue.qsize()}")
                     data = await asyncio.wait_for(self.db_queue.get(), timeout=1.0)
                     self.db_queue.task_done()
                 except asyncio.TimeoutError:
@@ -241,10 +240,10 @@ class DatabaseBatcher:
 
         except asyncio.CancelledError:
             if buffer:
-                log_msg("Info", f"[DATABASE] System shutdown signal intercepted. Initiating final data flush of {len(buffer)} measures...")
+                logging.info(f"[DATABASE] System shutdown signal intercepted. Initiating final data flush of {len(buffer)} measures...")
                 await self.insert_measures(buffer)
-            log_msg("Info", "[DATABASE] Ingestion funnel worker offline.")
+            logging.info("[DATABASE] Ingestion funnel worker offline.")
             raise
         except Exception as e:
-            log_msg("Error", f"[DATABASE] Funnel worker pipeline crashed: {e}")
+            logging.error(f"[DATABASE] Funnel worker pipeline crashed: {e}")
 

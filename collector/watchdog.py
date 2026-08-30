@@ -1,8 +1,7 @@
-import time, asyncio
+import time, asyncio, logging
 from datetime import datetime, timezone, timedelta
 
 from config import EXECUTION_MODE
-from logger import log_msg
 
 class Watchdog:
     def __init__(self, db, registry):
@@ -18,10 +17,10 @@ class Watchdog:
         Background tracking watchdog layer. Bypassed in standalone offline testing.
         """
         if EXECUTION_MODE == "OFFLINE_SIMULATION":
-            log_msg("Info", "[WATCHDOG] Watchdog not running in offline simulation.")
+            logging.info("[WATCHDOG] Watchdog not running in offline simulation.")
             return
 
-        log_msg("Info", "[WATCHDOG] Watchdog starting.")
+        logging.info("[WATCHDOG] Watchdog starting.")
 
         # Startup individual data sync verification
         last_sensor_times = await self.db.get_last_timestamps_per_sensor()
@@ -61,7 +60,7 @@ class Watchdog:
                     await self.registry.flag_data_gap(ble_id, True)
 
         except Exception as e:
-            log_msg("ERROR", f"[WATCHDOG ERROR] Heartbeat verification step failed: {e}")
+            logging.error(f"[WATCHDOG ERROR] Heartbeat verification step failed: {e}")
 
     async def _process_nightly_recovery(self, current_time: datetime) -> None:
         """
@@ -76,27 +75,27 @@ class Watchdog:
                     await self.registry.flag_data_gap(ble_id, False)
 
         except Exception as e:
-            log_msg("ERROR", f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
+            logging.error(f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
 
         try:
-            log_msg("INFO", "[IRM] Triggering scheduled daily fetch for Ernage...")
+            logging.info("[IRM] Triggering scheduled daily fetch for Ernage...")
             now_utc = datetime.now(timezone.utc)
             await self._fetch_and_store_irm_data(start_dt=now_utc - timedelta(days=1), end_dt=now_utc)
         except Exception as e:
-            log_msg("ERROR", f"[WATCHDOG ERROR] Nightly IRM external fetch failed: {e}")
+            logging.error(f"[WATCHDOG ERROR] Nightly IRM external fetch failed: {e}")
 
     async def _execute_startup_history_catchup(self, last_times) -> None:
         """
         Startup sequence recovering missing history data globally using pytp357s orchestration.
         Uses explicit timezone translation to eliminate historical time-drift.
         """
-        import os
+        import os, time
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         from pytp357s.fetcher import process_devices
         from models import SensorMeasure
 
-        log_msg("INFO", "[WATCHDOG] Initiating global startup history catchup sequence...")
+        logging.info("[WATCHDOG] Initiating global startup history catchup sequence...")
 
         # Dynamic timezone extraction from system environment
         local_tz = ZoneInfo(os.getenv("APP_TIMEZONE", "UTC"))
@@ -110,7 +109,7 @@ class Watchdog:
                 sensor_db_id = meta.get("sensor_db_id")
 
                 if not mac:
-                    log_msg("WARN", f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
+                    logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
                     continue
 
                 sensor_last_time = last_times.get(sensor_db_id)
@@ -119,13 +118,14 @@ class Watchdog:
                     diff_seconds = (now_utc - last_utc).total_seconds()
                     minutes_to_fetch = max(1, int(diff_seconds / 60))
                 else:
-                    log_msg("WARN", f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
+                    logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
                     continue
 
                 device = {ble_id: {"mac": mac}}
 
-                log_msg("INFO", f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
+                logging.info(f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
 
+                start_fetch = time.perf_counter()
                 timeout = 30.0
                 try:
                     raw_responses = await process_devices(
@@ -134,23 +134,27 @@ class Watchdog:
                         parallelism=1, force=False, max_fetch_count=0, verbose=False
                     )
                 except Exception as fetch_err:
-                    log_msg("WARN", f"[RECOVERY] Sensor {ble_id} link dropped or unreachable: {fetch_err}")
+                    logging.warning(f"[RECOVERY] Sensor {ble_id} link dropped or unreachable: {fetch_err}")
                     continue
 
+                elapsed_fetch = time.perf_counter() - start_fetch
 
                 result = raw_responses.get(ble_id) if isinstance(raw_responses, dict) else None
 
                 if not result or getattr(result, "status", "error") == "error":
                     reason = getattr(result, "message", "Timeout/No response received.")
-                    log_msg("WARN", f"[RECOVERY] Skipping {ble_id} (Unreachable or out of range after {timeout}s. Reason: {reason})")
+                    logging.warning(f"[RECOVERY] Skipping {ble_id} (Unreachable or out of range after {timeout}s. Reason: {reason})")
                     continue
 
                 records = result.data if (hasattr(result, "data") and result.data is not None) else []
                 if not records:
-                    log_msg("WARN", f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
+                    logging.info(f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
                     continue
 
+                ratio = minutes_to_fetch / elapsed_fetch if elapsed_fetch > 0 else 0
 
+                logging.info(f"[BENCHMARK] Fetch terminé en {elapsed_fetch:.2f} secondes pour {minutes_to_fetch} minutes demandées.")
+                logging.info(f"[BENCHMARK] Vitesse estimée : {ratio:.1f} minutes de données récupérées par seconde réelle.")
 
                 buffer: list[SensorMeasure] = []
                 for dt, temp, hum in records:
@@ -164,14 +168,14 @@ class Watchdog:
                     ))
 
                 if buffer:
-                    log_msg("INFO", f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
+                    logging.info(f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
                     try:
                         await self.db.insert_measures(buffer)
                     except Exception as db_err:
-                        log_msg("WARN", f"[RECOVERY] Non-blocking database return notification: {db_err}")
+                        logging.warning(f"[RECOVERY] Non-blocking database return notification: {db_err}")
 
         except Exception as e:
-            log_msg("ERROR", f"[RECOVERY ERROR] Startup sync evaluation collapsed: {e}")
+            logging.error(f"[RECOVERY ERROR] Startup sync evaluation collapsed: {e}")
 
     async def _execute_irm_history_catchup(self, last_time: datetime) -> None:
         """
@@ -180,7 +184,7 @@ class Watchdog:
         # Enforce UTC awareness for safe datetime arithmetic
         lt_utc = last_time.replace(tzinfo=timezone.utc) if not last_time.tzinfo else last_time.astimezone(timezone.utc)
 
-        log_msg("INFO", "[IRM] Starting cold-start catchup for Ernage station...")
+        logging.info("[IRM] Starting cold-start catchup for Ernage station...")
         await self._fetch_and_store_irm_data(start_dt=lt_utc)
 
     async def _fetch_and_store_irm_data(self, start_dt: datetime) -> None:
@@ -196,7 +200,7 @@ class Watchdog:
         end_dt = datetime.now(timezone.utc)
 
         try:
-            log_msg("INFO", "[IRM] Connecting to Ernage station...")
+            logging.info("[IRM] Connecting to Ernage station...")
             async with aiohttp.ClientSession() as session:
                 while current_start < end_dt:
                     current_end = min(current_start + timedelta(days=3), end_dt)
@@ -216,7 +220,7 @@ class Watchdog:
                         timeout=30
                     ) as response:
                         if response.status != 200:
-                            log_msg("ERROR", f"[IRM] Data server rejected request with status code: {response.status}")
+                            logging.error(f"[IRM] Data server rejected request with status code: {response.status}")
                             return
 
                         # Core parsing iteration over the official IRM JSON matrix structure
@@ -226,7 +230,7 @@ class Watchdog:
 
                             # Skip if any required weather metric or timestamp is missing
                             if not p.get("timestamp") or p.get("temp_dry_shelter_avg") is None or p.get("humidity_rel_shelter_avg") is None:
-                                log_msg("WARN", f"[IRM] Skipping incomplete record. Payload: {p}")
+                                logging.warning(f"[IRM] Skipping incomplete record. Payload: {p}")
                                 continue
 
                             buffer.append(SensorMeasure(
@@ -238,15 +242,15 @@ class Watchdog:
                             ))
 
                         if buffer:
-                            log_msg("INFO", f"[IRM] Successfully parsed {len(buffer)} records. Flushing to database...")
+                            logging.info(f"[IRM] Successfully parsed {len(buffer)} records. Flushing to database...")
                             try:
                                 await self.db.insert_measures(buffer)
                             except Exception as db_err:
-                                log_msg("WARN", f"[IRM] Non-blocking database insertion warning: {db_err}")
+                                logging.warning(f"[IRM] Non-blocking database insertion warning: {db_err}")
                         else:
-                            log_msg("WARN", "[IRM] Sync sequence completed but zero valid station metrics were captured.")
+                            logging.warning("[IRM] Sync sequence completed but zero valid station metrics were captured.")
 
                     current_start = current_end
 
         except Exception as network_error:
-            log_msg("ERROR", f"[IRM ERROR] Asynchronous network extraction sequence collapsed: {network_error}")
+            logging.error(f"[IRM ERROR] Asynchronous network extraction sequence collapsed: {network_error}")

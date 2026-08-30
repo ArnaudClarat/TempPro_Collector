@@ -1,17 +1,24 @@
-import os, sys, time, asyncio
+import os, sys, time, asyncio, logging
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 from bleak import BleakScanner
 from typing import Optional
 
-from config import EXECUTION_MODE
-from logger import log_msg
+from config import EXECUTION_MODE, CURRENT_LOG_LEVEL
 from decoder import MeasureParser
 from db import DatabaseBatcher
 from mapping import SensorRegistry
 from watchdog import Watchdog
 from models import SensorMeasure
+
+logging.basicConfig(
+    level=CURRENT_LOG_LEVEL,
+    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout
+)
+logger = logging.getLogger("collector")
 
 database_batcher = DatabaseBatcher()
 sensor_registry = SensorRegistry(database_batcher)
@@ -30,7 +37,7 @@ class BleScanner:
         Filters incoming BLE advertisements from ThermoPro sensors and processes payloads.
         """
         # Quick guard clause: filter out any device that isn't a ThermoPro 357S
-        if "TP357S" not in (device.name or ""): #Replace by "8AE3" for test sensor onlyh
+        if "TP357S" not in (device.name or ""): #Replace by "8AE3" for test sensor only
             return
 
         # Extract manufacturer payload (skip empty background advertisements safely)
@@ -43,7 +50,7 @@ class BleScanner:
             if EXECUTION_MODE == "OFFLINE_SIMULATION":
                 # Direct streaming to stdout for standalone local validation
                 decoded = measure_parser.decode_tp357(manufacturer_id, payload)
-                log_msg("INFO", f"[OFFLINE TEST] Sensor: {ble_id} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity_raw']}%")
+                looger.info(f"[OFFLINE TEST] Sensor: {ble_id} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity_raw']}%")
             else:
                 # Production pipeline: forward raw packet to the async decoder queue
                 packet = {
@@ -52,7 +59,7 @@ class BleScanner:
                     "payload": payload,
                     "time": arrival_time
                 }
-                log_msg("INFO", f"[CALLBACK] Verified packet captured for sensor: {ble_id} -> Pushing to decoder queue.")
+                logger.info(f"[CALLBACK] Verified packet captured for sensor: {ble_id} -> Pushing to decoder queue.")
                 measure_parser.raw_data_queue.put_nowait(packet)
 
     async def start_scanning(self, stop_event: asyncio.Event) -> None:
@@ -60,7 +67,7 @@ class BleScanner:
         Mounts the BleakScanner context manager onto the processing loop thread.
         """
         self._scanner = BleakScanner(detection_callback=self.callback)
-        log_msg("INFO", "[SYSTEM] BLE Ingestion Engine online. Monitoring background packets...")
+        logger.info("[SYSTEM] BLE Ingestion Engine online. Monitoring background packets...")
         await self._scanner.start()
         await stop_event.wait()
         await self._scanner.stop()
@@ -71,7 +78,7 @@ async def main():
     Features an auto-restart loop to bypass Windows 11 hardware scanning timeout constraints.
     """
 
-    log_msg("Info", f"Active mode : [{EXECUTION_MODE}] (Ctrl+C to terminate)")
+    logger.info(f"Active mode : [{EXECUTION_MODE}] (Ctrl+C to terminate)")
 
     db_worker_task = None
     decoder_task = None
@@ -89,10 +96,20 @@ async def main():
         decoder_task = asyncio.create_task(measure_parser.decoder_loop())
         watchdog_task = asyncio.create_task(watchdog.start_worker())
 
+        def handle_task_result(t: asyncio.Task):
+            if not t.cancelled() and t.exception():
+                logger.error(f"[TASK CRASH] Background task {t.get_name()} collapsed: {t.exception()}", exc_info=t.exception())
+
+        db_worker_task.add_done_callback(handle_task_result)
+        decoder_task.add_done_callback(handle_task_result)
+        watchdog_task.add_done_callback(handle_task_result)
+
+        await asyncio.sleep(0.5) 
+
     stop_event = asyncio.Event()
 
     def ask_for_shutdown():
-        log_msg("INFO", "[SYSTEM] Intercepted Ctrl+C signal! Releasing main thread for cleanup...")
+        logger.info("[SYSTEM] Intercepted Ctrl+C signal! Releasing main thread for cleanup...")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -112,11 +129,11 @@ async def main():
         ask_for_shutdown()
 
     except Exception as runtime_error:
-        log_msg("ERROR", f"[SYSTEM CRITICAL BREAKDOWN] Main loop collapsed unexpectedly: {runtime_error}")
+        logger.error(f"[SYSTEM CRITICAL BREAKDOWN] Main loop collapsed unexpectedly: {runtime_error}")
 
     finally:
         # Trigger clean shutdown loop
-        log_msg("INFO", "[SYSTEM] Shutdown instruction detected. Tearing down background tasks...")
+        logger.info("[SYSTEM] Shutdown instruction detected. Tearing down background tasks...")
 
         tasks_to_cancel = [t for t in [watchdog_task, decoder_task, db_worker_task] if t is not None]
         if tasks_to_cancel:
@@ -126,7 +143,7 @@ async def main():
 
         if EXECUTION_MODE != "OFFLINE_SIMULATION":
             await database_batcher.close_db()
-        log_msg("INFO", "Subsystems terminated cleanly.")
+        logger.info("Subsystems terminated cleanly.")
 
 if __name__ == "__main__":
     try:
