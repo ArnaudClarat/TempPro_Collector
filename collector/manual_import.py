@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from db import DatabaseBatcher
 from models import SensorMeasure, SensorMetadata
 
-CSV_ENCODING, CSV_COLUMNS, 4, 5000
+CSV_ENCODING, CSV_COLUMNS, BATCH_SIZE = "utf-8-sig", 4, 5000
 LOCAL_TIMEZONE = ZoneInfo("Europe/Brussels")
 IMPORT_DIR = PROJECT_ROOT / "import"
 ARCHIVE_DIR = PROJECT_ROOT / "archive"
