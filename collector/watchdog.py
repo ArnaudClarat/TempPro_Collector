@@ -83,14 +83,14 @@ class Watchdog:
                     await self.registry.flag_data_gap(ble_id, False)
 
         except Exception as e:
-            logging.error(f"[WATCHDOG ERROR] Nightly recovery window execution aborted: {e}")
+            logging.error(f"[RECOVERY] Nightly recovery window execution aborted: {e}")
 
         try:
-            logging.info("[IRM] Triggering scheduled daily fetch for Ernage...")
+            logging.info("[RECOVERY] Triggering scheduled daily fetch for Ernage...")
             now_utc = datetime.now(timezone.utc)
             await self._fetch_and_store_irm_data(start_dt=now_utc - timedelta(days=1), end_dt=now_utc)
         except Exception as e:
-            logging.error(f"[WATCHDOG ERROR] Nightly IRM external fetch failed: {e}")
+            logging.error(f"[RECOVERY] Nightly IRM external fetch failed: {e}")
 
     async def _fetch_history(self, sensor) -> None:
         """
@@ -181,7 +181,7 @@ class Watchdog:
                     logging.warning(f"[RECOVERY] Non-blocking database return notification: {db_err}")
 
         except Exception as e:
-            logging.error(f"[RECOVERY ERROR] Startup sync evaluation collapsed: {e}")
+            logging.error(f"[RECOVERY] Startup sync evaluation collapsed: {e}")
 
     async def _execute_irm_history_catchup(self, sensor) -> None:
         """

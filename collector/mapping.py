@@ -21,8 +21,8 @@ class SensorRegistry:
         Loads all active sensors and assignments from the database into the RAM cache.
         Optimized to bypass database queries if the cache is already initialized.
         """
-        if SensorRegistry._mapping_cache:
-            return SensorRegistry._mapping_cache
+        if self._mapping_cache:
+            return self._mapping_cache
 
         if self.db.pool is None:
             logging.warning("[MAPPING] Database pool uninitialized, skipping cache load.")
@@ -44,12 +44,12 @@ class SensorRegistry:
                         FROM sensors s
                         JOIN sensor_assignments sa ON s.id = sa.sensor_id
                         JOIN locations l ON sa.location_id = l.id
-                        WHERE sa.removed_at IS NULL;
+                        WHERE sa.removed_at IS NULL OR sa.removed_at > NOW();
                         """
                     )
                     rows = await cur.fetchall()
 
-                    SensorRegistry._mapping_cache = {}
+                    self._mapping_cache = []
 
                     for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
                         self._mapping_cache.append(Sensor(
@@ -68,8 +68,8 @@ class SensorRegistry:
         except Exception as e:
             logging.error(f"[MAPPING ERROR] Failed to load schema mapping from database: {e}")
             raise e
-
-        return SensorRegistry._mapping_cache
+        print(self._mapping_cache)
+        return self._mapping_cache
 
 
     async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> Sensor:
@@ -78,7 +78,7 @@ class SensorRegistry:
         If the device is unknown, it triggers an automated database registration
         and updates the memory cache dynamically for subsequent lookups.
         """
-        async with SensorRegistry._lock_mapping:
+        async with self._lock_mapping:
             mapping_data = await self.load_mapping()
 
             sensor = next((s for s in mapping_data if s.ble_id == ble_id), None)
@@ -115,26 +115,27 @@ class SensorRegistry:
         Removes a sensor from the RAM cache instantly.
         Typically invoked by the Watchdog routine upon permanent connection failure.
         """
-        async with SensorRegistry._lock_mapping:
-            removed = SensorRegistry._mapping_cache.pop(ble_id, None)
+        async with self._lock_mapping:
+            removed = self._mapping_cache.remove(ble_id)
             if removed:
                 logging.warning(f"[MAPPING] Sensor {ble_id} (ID: {removed.sensor_db_id}) evicted from cache.")
 
-    async def flag_data_gap(self, ble_id: str, has_gap: bool) -> None:
+    async def toggle_data_gap(self, sensor: Sensor) -> None:
         """
         Updates the data gap state flag for a specific tracked sensor in memory.
         """
-        async with SensorRegistry._lock_mapping:
-            if ble_id in SensorRegistry._mapping_cache:
-                SensorRegistry._mapping_cache[ble_id]["has_data_gap"] = has_gap
+        async with self._lock_mapping:
+            if sensor in self._mapping_cache:
+                sensor.has_data_gap = not sensor.has_data_gap
 
     async def get_sensors(self) -> List[Sensor]:
         """
         Returns a safe shallow copy of the active sensors memory mapping cache.
         Prevents concurrent modification exceptions during asynchronous loops iterations.
         """
-        async with SensorRegistry._lock_mapping:
-            return SensorRegistry._mapping_cache.copy()
+        async with self._lock_mapping:
+            return self._mapping_cache.copy()
+
     async def get_up_sensors(self) -> List[Sensor]:
         """
         Returns a safe shallow copy of the sensors who didn't finished their history catchup.
