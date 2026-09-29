@@ -8,8 +8,8 @@ class Sensor:
     Represents a raw environmental reading collected from a ThermoPro S-Series hardware sensor.
     Optimized with slots to minimize memory footprint during high-volume GATT historical backlogs.
     """
-    db_id: int
     ble_id: str
+    db_id: int = None
     mac_address: str = None
     location_name: str = None
     last_seen_timestamp: float = None

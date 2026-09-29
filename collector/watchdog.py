@@ -111,11 +111,11 @@ class Watchdog:
         try:
             mapping = await self.registry.load_mapping()
             now_utc = datetime.now(timezone.utc)
-
-            mac = sensor.mac_address
+            print(sensor)
+            mac_address = sensor.mac_address
             ble_id = sensor.ble_id
 
-            if not mac:
+            if not mac_address:
                 logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
                 return
 
@@ -127,7 +127,7 @@ class Watchdog:
                 logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
                 return
 
-            device = {ble_id: {"mac": mac}}
+            device = {ble_id: {"mac": mac_address}}
 
             logging.info(f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
 
@@ -165,9 +165,11 @@ class Watchdog:
             buffer: list[Measure] = []
             for dt, temp, hum in records:
                 utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz).astimezone(timezone.utc)
+                sensor = await self.registry.get_sensor(ble_id, mac_address)
                 buffer.append(Measure(
                     time=utc_time,
-                    sensor= await self.registry.get_sensor(ble_id),
+                    sensor= sensor,
+                    sensor_id=sensor.db_id,
                     ble_id=ble_id,
                     temperature=round(float(temp), 2),
                     humidity_raw=round(float(hum), 2)

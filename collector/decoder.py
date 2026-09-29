@@ -34,13 +34,14 @@ class MeasureParser:
             while True:
                 # Wait for a raw packet from the scanner callback
                 packet = await self.raw_data_queue.get()
-
+                print(packet)
                 try:
                     # Import for the queue
                     # Decode the raw bytes into human-readable metrics
                     decoded = self.decode_tp357(packet['manufacturer_id'], packet['payload'])
                     ble_id = packet['ble_id']
-                    sensor = await self.registry.get_sensor(ble_id)
+                    mac_address = packet['mac_address']
+                    sensor = await self.registry.get_sensor(ble_id, mac_address)
 
                     measure = Measure(
                         time=packet["time"],

@@ -13,7 +13,7 @@ from watchdog import Watchdog
 
 logging.basicConfig(
     level=CURRENT_LOG_LEVEL,
-    format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+    format="%(asctime)s.%(msecs)03d [%(name)s] [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout
 )
@@ -44,7 +44,8 @@ class BleScanner:
             arrival_time = datetime.now(timezone.utc)
 
             # Robust ID extraction: use MAC address suffix if name split fails
-            ble_id = device.name.split("(")[-1].replace(")", "") if "(" in device.name else device.address[-4:].replace(":", "")
+            ble_id = device.name.split("(")[-1].replace(")", "")
+            mac_address = device.address[-17:]
 
             if EXECUTION_MODE == "OFFLINE_SIMULATION":
                 # Direct streaming to stdout for standalone local validation
@@ -55,6 +56,7 @@ class BleScanner:
                 packet = {
                     "ble_id": ble_id,
                     "manufacturer_id": manufacturer_id,
+                    "mac_address": mac_address,
                     "payload": payload,
                     "time": arrival_time
                 }

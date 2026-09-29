@@ -11,7 +11,13 @@ class DatabaseBatcher:
         self.db_queue: Optional[asyncio.Queue] = None
         self.pool: Optional[AsyncConnectionPool] = None
 
-    async def init_db(self) -> None:
+    async def get_conn(self) -> None:
+        if self.pool is None or self.pool.closed:
+            logging.error("[DATABASE] Pool was lost or closed. Re-establishing connection...")
+            await self._init_db()
+        return self.pool.connection()
+
+    async def _init_db(self) -> None:
         """
         Initializes the asynchronous PostgreSQL connection pool if required by the execution mode.
         """

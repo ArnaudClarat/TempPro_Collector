@@ -73,7 +73,7 @@ class SensorRegistry:
         return self._mapping_cache
 
 
-    async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> Sensor:
+    async def get_sensor(self, ble_id: str, mac_address: str | None = None) -> Sensor:
         """
         Retrieves a sensor record from the RAM cache.
         If the device is unknown, it triggers an automated database registration
@@ -83,11 +83,12 @@ class SensorRegistry:
             mapping_data = await self.load_mapping()
 
             sensor = next((s for s in mapping_data if s.ble_id == ble_id), None)
-
-            if sensor is None:
+            print(f"ble_id : {ble_id} | mac : {mac_address} | sensor : {sensor}")
+            if sensor is None and mac_address is not None:
                 logging.warning(f"[MAPPING] Unknown sensor detected ({ble_id}). Initiating auto-registration...")
                 try:
-                    sensor_db_id = await self.db.insert_sensor(ble_id, mac_address)
+                    sensor = Sensor(ble_id=ble_id, mac_address=mac_address)
+                    sensor_db_id = await self.db.insert_sensor(sensor)
 
                     mapping_data.append(Sensor(
                         sensor_db_id=sensor_db_id,
@@ -102,10 +103,11 @@ class SensorRegistry:
                     logging.warning(f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
 
                 except Exception as e:
-                    logging.error(f"[MAPPING ERROR] Automated registration failed for device {ble_id}: {e}")
+                    logging.error(f"[MAPPING] Automated registration failed for device {ble_id}: {e}")
                     raise e
+            elif mac_address is None:
+                raise ValueError(f"[MAPPING] No mac_address given")
             else:
-                sensor.last_seen_timestamp = time.monotonic()
                 if mac_address and not sensor.mac_address:
                     sensor.mac_address = mac_address
 
