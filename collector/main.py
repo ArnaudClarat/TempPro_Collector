@@ -10,7 +10,6 @@ from decoder import MeasureParser
 from db import DatabaseBatcher
 from mapping import SensorRegistry
 from watchdog import Watchdog
-from models import SensorMeasure
 
 logging.basicConfig(
     level=CURRENT_LOG_LEVEL,

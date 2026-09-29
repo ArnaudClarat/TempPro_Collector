@@ -1,7 +1,7 @@
 import struct, asyncio, logging
 from typing import Dict, Any
 
-from models import SensorMeasure
+from models import Measure, Sensor
 
 class MeasureParser:
     def __init__(self, registry):
@@ -40,13 +40,11 @@ class MeasureParser:
                     # Decode the raw bytes into human-readable metrics
                     decoded = self.decode_tp357(packet['manufacturer_id'], packet['payload'])
                     ble_id = packet['ble_id']
+                    sensor = await self.registry.get_sensor(ble_id)
 
-                    sensor_metadata = await self.registry.get_sensor(ble_id)
-                    sensor_db_id = sensor_metadata.sensor_db_id if sensor_metadata else 0
-
-                    measure = SensorMeasure(
+                    measure = Measure(
                         time=packet["time"],
-                        sensor_id=sensor_db_id,
+                        sensor=sensor,
                         ble_id=ble_id,
                         temperature=round(float(decoded["temperature"]), 2),
                         humidity_raw=round(float(decoded["humidity_raw"]), 2),

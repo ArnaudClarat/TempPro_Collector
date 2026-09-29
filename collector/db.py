@@ -4,7 +4,7 @@ from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone
 
 from config import EXECUTION_MODE
-from models import SensorMeasure
+from models import Measure, Sensor
 
 class DatabaseBatcher:
     def __init__(self):
@@ -44,9 +44,9 @@ class DatabaseBatcher:
             self.pool = None
             logging.info("[DATABASE] Connection pool closed successfully.")
 
-    async def insert_measures(self, buffer: List[SensorMeasure]) -> None:
+    async def insert_measures(self, buffer: List[Measure]) -> None:
         """
-        Inserts a batch of SensorMeasure objects into the database, or simulates
+        Inserts a batch of Measure objects into the database, or simulates
         the insertion depending on the APP_EXECUTION_MODE value.
         """
         if not buffer:
@@ -62,7 +62,7 @@ class DatabaseBatcher:
         bindings_matrix = [
             (
                 m.time,
-                m.sensor_id,
+                sensor_id,
                 m.temperature,
                 m.humidity_raw,
                 m.battery_raw
@@ -145,7 +145,7 @@ class DatabaseBatcher:
             logging.error(f"[DATABASE] Failed to update and terminate active device tracking assignment: {e}")
             raise e
 
-    async def get_last_timestamps_per_sensor(self) -> Dict[int, datetime]:
+    async def get_last_timestamps_per_sensor(self) -> List[Sensor]:
         """
         Retrieves the latest measurement timestamp stored for each unique active sensor.
         Queries the underlying database partition and returns a mapping dictionary.
@@ -154,18 +154,26 @@ class DatabaseBatcher:
             # Simulated environment fallback: bypass structural SQL query execution
             return {}
 
-        query = "SELECT sensor_id, MAX(time) FROM measures GROUP BY sensor_id;"
-        timestamps = {}
+        query = "SELECT s.ble_id, s.mac_address, MAX(m.time) FROM measures as m LEFT JOIN sensors as s ON m.sensor_id = s.id GROUP BY s.ble_id, s.mac_address;"
+        timestamps = []
 
         try:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query)
                     rows = await cur.fetchall()
-                    for sensor_id, last_time in rows:
+                    for ble_id, mac_address, last_time in rows:
                         if last_time:
                             # Enforce explicit UTC timezone alignment on native datetimes
-                            timestamps[sensor_id] = last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time
+                            timestamps.append(Sensor(
+                                db_id=None,
+                                ble_id=ble_id,
+                                mac_address=mac_address,
+                                location_name=None,
+                                last_seen_timestamp=last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time,
+                                has_data_gap=False,
+                                history_catchup_completed=False
+                            )) 
         except Exception as e:
             logging.error(f"[DATABASE] Failed to fetch per-sensor historical boundaries: {e}")
 
@@ -177,9 +185,9 @@ class DatabaseBatcher:
         """
         logging.info("[DATABASE] Ingestion funnel background pipeline worker initializing.")
         from datetime import timedelta
-        from models import SensorMeasure
+        from models import Measure
 
-        buffer: List[SensorMeasure] = []
+        buffer: List[Measure] = []
         minute_accumulator: Dict[str, Dict[str, List[float]]] = {}
         current_minute = datetime.now(timezone.utc).minute
 
@@ -223,7 +231,7 @@ class DatabaseBatcher:
                             sensor_info = await sensor_registry.get_sensor(ble_id)
 
                             # Instantiating the typed dataclass object directly inside the buffer
-                            buffer.append(SensorMeasure(
+                            buffer.append(Measure(
                                 ble_id=ble_id,
                                 sensor_id=sensor_info.sensor_db_id,
                                 temperature=avg_temp,

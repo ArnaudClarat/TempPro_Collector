@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from db import DatabaseBatcher
-from models import SensorMeasure, SensorMetadata
+from models import SensorMeasure, Sensor
 
 CSV_ENCODING, CSV_COLUMNS, BATCH_SIZE = "utf-8-sig", 4, 5000
 LOCAL_TIMEZONE = ZoneInfo("Europe/Brussels")
@@ -27,7 +27,7 @@ logger = logging.getLogger("thermopro-importer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("csv-importer")
 
-async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> SensorMetadata:
+async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> Sensor:
     """Inspects the CSV metadata header to discover the location name and lookup its physical sensor ID."""
     parts = file_path.stem.split("_")
     if len(parts) < 2:
@@ -52,10 +52,11 @@ async def resolve_sensor_id_from_file(db: DatabaseBatcher, file_path: Path) -> S
                 raise ValueError(f"No active hardware assignment mapping found for location '{location_name}' in DB.")
             
             # Retourne l'objet standard attendu par votre architecture
-            return SensorMetadata(
+            return Sensor(
                 sensor_db_id=result[0],
                 mac_address=result[1],
-                location_name=location_name
+                location_name=location_name,
+                last_seen_timestamp=None
             )
 
 def parse_csv(file_path: Path, ble_id: str, sensor_id: int):

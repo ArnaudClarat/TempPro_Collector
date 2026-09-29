@@ -10,7 +10,7 @@ class Watchdog:
         self._ble_active_lock = asyncio.Lock()
         self.db = db
         self.registry = registry
-        self.boxcode = 6459
+        self.boxcode = "6459"
 
     async def start_worker(self) -> None:
         """
@@ -23,9 +23,17 @@ class Watchdog:
         logging.info("[WATCHDOG] Watchdog starting.")
 
         # Startup individual data sync verification
-        last_sensor_times = await self.db.get_last_timestamps_per_sensor()
-        await self._execute_startup_history_catchup(last_sensor_times)
-        await self._execute_irm_history_catchup(last_sensor_times.get(self.boxcode))
+        logging.info("[WATCHDOG] Initiating global startup history catchup sequence...")
+        mapping = await self.registry.load_mapping()
+        last_sensors_times = await self.db.get_last_timestamps_per_sensor()
+        for partial_sensor in last_sensors_times:
+            full_sensor = next((s for s in mapping if s.ble_id == partial_sensor.ble_id), None)
+            if full_sensor:
+                full_sensor.last_seen_timestamp = partial_sensor.last_seen_timestamp
+                if full_sensor.ble_id == self.boxcode:
+                    await self._execute_irm_history_catchup(full_sensor)
+                else:
+                    await self._fetch_history(full_sensor)
         try:
             while True:
                 await asyncio.sleep(1.0)
@@ -84,7 +92,7 @@ class Watchdog:
         except Exception as e:
             logging.error(f"[WATCHDOG ERROR] Nightly IRM external fetch failed: {e}")
 
-    async def _execute_startup_history_catchup(self, last_times) -> None:
+    async def _fetch_history(self, sensor) -> None:
         """
         Startup sequence recovering missing history data globally using pytp357s orchestration.
         Uses explicit timezone translation to eliminate historical time-drift.
@@ -93,7 +101,7 @@ class Watchdog:
         from datetime import datetime, timezone
         from zoneinfo import ZoneInfo
         from pytp357s.fetcher import process_devices
-        from models import SensorMeasure
+        from models import Measure
 
         logging.info("[WATCHDOG] Initiating global startup history catchup sequence...")
 
@@ -104,102 +112,93 @@ class Watchdog:
             mapping = await self.registry.load_mapping()
             now_utc = datetime.now(timezone.utc)
 
-            for ble_id, meta in mapping.items():
-                mac = meta.get("mac_address")
-                sensor_db_id = meta.get("sensor_db_id")
+            mac = sensor.mac_address
+            ble_id = sensor.ble_id
 
-                if not mac:
-                    logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
-                    continue
+            if not mac:
+                logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No MAC assigned).")
+                return
 
-                sensor_last_time = last_times.get(sensor_db_id)
-                if sensor_last_time:
-                    last_utc = sensor_last_time.replace(tzinfo=timezone.utc) if sensor_last_time.tzinfo is None else sensor_last_time.astimezone(timezone.utc)
-                    diff_seconds = (now_utc - last_utc).total_seconds()
-                    minutes_to_fetch = max(1, int(diff_seconds / 60))
-                else:
-                    logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
-                    continue
+            if sensor.last_seen_timestamp:
+                last_utc = sensor.last_seen_timestamp.replace(tzinfo=timezone.utc) if sensor.last_seen_timestamp.tzinfo is None else sensor.last_seen_timestamp.astimezone(timezone.utc)
+                diff_seconds = (now_utc - last_utc).total_seconds()
+                minutes_to_fetch = max(1, int(diff_seconds / 60))
+            else:
+                logging.warning(f"[RECOVERY] Skipping recovery for virtual asset {ble_id} (No last time).")
+                return
 
-                device = {ble_id: {"mac": mac}}
+            device = {ble_id: {"mac": mac}}
 
-                logging.info(f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
+            logging.info(f"[RECOVERY] Submitting pipeline to fetch past {minutes_to_fetch} minutes from {ble_id}")
 
-                start_fetch = time.perf_counter()
-                timeout = 30.0
+            start_fetch = time.perf_counter()
+            timeout = 30.0
+            try:
+                raw_responses = await process_devices(
+                    devices=device, live=False, db_path=None, incremental=False,
+                    count=minutes_to_fetch, overlap=0, timeout=timeout, scan_timeout=5.0,
+                    parallelism=1, force=False, max_fetch_count=0, verbose=False
+                )
+            except Exception as fetch_err:
+                logging.warning(f"[RECOVERY] Sensor {ble_id} link dropped or unreachable: {fetch_err}")
+                return
+
+            elapsed_fetch = time.perf_counter() - start_fetch
+
+            result = raw_responses.get(ble_id) if isinstance(raw_responses, dict) else None
+
+            if not result or getattr(result, "status", "error") == "error":
+                reason = getattr(result, "message", "Timeout/No response received.")
+                logging.warning(f"[RECOVERY] Skipping {ble_id} (Unreachable or out of range after {timeout}s. Reason: {reason})")
+                return
+
+            records = result.data if (hasattr(result, "data") and result.data is not None) else []
+            if not records:
+                logging.info(f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
+                return
+
+            ratio = minutes_to_fetch / elapsed_fetch if elapsed_fetch > 0 else 0
+
+            logging.info(f"[BENCHMARK] Fetch terminé en {elapsed_fetch:.2f} secondes pour {minutes_to_fetch} minutes demandées.")
+            logging.info(f"[BENCHMARK] Vitesse estimée : {ratio:.1f} minutes de données récupérées par seconde réelle.")
+
+            buffer: list[Measure] = []
+            for dt, temp, hum in records:
+                utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz).astimezone(timezone.utc)
+                buffer.append(Measure(
+                    time=utc_time,
+                    sensor= await self.registry.get_sensor(ble_id),
+                    ble_id=ble_id,
+                    temperature=round(float(temp), 2),
+                    humidity_raw=round(float(hum), 2)
+                ))
+
+            if buffer:
+                logging.info(f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
                 try:
-                    raw_responses = await process_devices(
-                        devices=device, live=False, db_path=None, incremental=False,
-                        count=minutes_to_fetch, overlap=0, timeout=timeout, scan_timeout=5.0,
-                        parallelism=1, force=False, max_fetch_count=0, verbose=False
-                    )
-                except Exception as fetch_err:
-                    logging.warning(f"[RECOVERY] Sensor {ble_id} link dropped or unreachable: {fetch_err}")
-                    continue
-
-                elapsed_fetch = time.perf_counter() - start_fetch
-
-                result = raw_responses.get(ble_id) if isinstance(raw_responses, dict) else None
-
-                if not result or getattr(result, "status", "error") == "error":
-                    reason = getattr(result, "message", "Timeout/No response received.")
-                    logging.warning(f"[RECOVERY] Skipping {ble_id} (Unreachable or out of range after {timeout}s. Reason: {reason})")
-                    continue
-
-                records = result.data if (hasattr(result, "data") and result.data is not None) else []
-                if not records:
-                    logging.info(f"[RECOVERY] No historical flash records captured for sensor {ble_id}.")
-                    continue
-
-                ratio = minutes_to_fetch / elapsed_fetch if elapsed_fetch > 0 else 0
-
-                logging.info(f"[BENCHMARK] Fetch terminé en {elapsed_fetch:.2f} secondes pour {minutes_to_fetch} minutes demandées.")
-                logging.info(f"[BENCHMARK] Vitesse estimée : {ratio:.1f} minutes de données récupérées par seconde réelle.")
-
-                buffer: list[SensorMeasure] = []
-                for dt, temp, hum in records:
-                    utc_time = dt.replace(second=0, microsecond=0, tzinfo=local_tz).astimezone(timezone.utc)
-                    buffer.append(SensorMeasure(
-                        time=utc_time,
-                        sensor_id=sensor_db_id,
-                        ble_id=ble_id,
-                        temperature=round(float(temp), 2),
-                        humidity_raw=round(float(hum), 2)
-                    ))
-
-                if buffer:
-                    logging.info(f"[RECOVERY] Flushing {len(buffer)} object measures to DB for {ble_id}...")
-                    try:
-                        await self.db.insert_measures(buffer)
-                    except Exception as db_err:
-                        logging.warning(f"[RECOVERY] Non-blocking database return notification: {db_err}")
+                    await self.db.insert_measures(buffer)
+                except Exception as db_err:
+                    logging.warning(f"[RECOVERY] Non-blocking database return notification: {db_err}")
 
         except Exception as e:
             logging.error(f"[RECOVERY ERROR] Startup sync evaluation collapsed: {e}")
 
-    async def _execute_irm_history_catchup(self, last_time: datetime) -> None:
+    async def _execute_irm_history_catchup(self, sensor) -> None:
         """
         Startup sequence recovering missing IRM historical data.
         """
-        # Enforce UTC awareness for safe datetime arithmetic
-        lt_utc = last_time.replace(tzinfo=timezone.utc) if not last_time.tzinfo else last_time.astimezone(timezone.utc)
+        import aiohttp
+        from models import Measure
 
         logging.info("[IRM] Starting cold-start catchup for Ernage station...")
-        await self._fetch_and_store_irm_data(start_dt=lt_utc)
-
-    async def _fetch_and_store_irm_data(self, start_dt: datetime) -> None:
-        """
-        Executes asynchronous HTTP extraction from IRM servers, parses station records,
-        and flushes typed SensorMeasure structures to TimescaleDB.
-        """
-
-        import aiohttp
-        from models import SensorMeasure
-
-        current_start = start_dt
-        end_dt = datetime.now(timezone.utc)
 
         try:
+            # Enforce UTC awareness for safe datetime arithmetic
+            sensor.last_seen_timestamp = sensor.last_seen_timestamp.replace(tzinfo=timezone.utc) if not sensor.last_seen_timestamp.tzinfo else sensor.last_seen_timestamp.astimezone(timezone.utc)
+
+            current_start = sensor.last_seen_timestamp
+            end_dt = datetime.now(timezone.utc)
+            
             logging.info("[IRM] Connecting to Ernage station...")
             async with aiohttp.ClientSession() as session:
                 while current_start < end_dt:
@@ -230,13 +229,13 @@ class Watchdog:
 
                             # Skip if any required weather metric or timestamp is missing
                             if not p.get("timestamp") or p.get("temp_dry_shelter_avg") is None or p.get("humidity_rel_shelter_avg") is None:
-                                logging.warning(f"[IRM] Skipping incomplete record. Payload: {p}")
+                                logging.warning(f"[RECOVERY] Skipping incomplete record. Payload: {p}")
                                 continue
 
-                            buffer.append(SensorMeasure(
+                            buffer.append(Measure(
                                 time=datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")),
-                                sensor_id=self.boxcode,
-                                ble_id="IRM_ERNAGE",
+                                sensor=sensor,
+                                ble_id="",
                                 temperature=round(float(p["temp_dry_shelter_avg"]), 1),
                                 humidity_raw=int(round(float(p["humidity_rel_shelter_avg"])))
                             ))

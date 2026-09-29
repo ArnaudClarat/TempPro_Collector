@@ -1,14 +1,13 @@
 import time, asyncio, json, logging
-from typing import List, Dict, Any, Optional
+from typing import List, Any, Optional
 
-from models import SensorMetadata
+from models import Sensor
 
 class SensorRegistry:
-    _mapping_cache: Dict[str, Dict[str, Any]] = {}
-    _lock_mapping = asyncio.Lock()
-
     def __init__(self, database_batcher):
         self.db = database_batcher
+        self._lock_mapping = asyncio.Lock()
+        self._mapping_cache: List[Sensor] = []
 
     @staticmethod
     def _read_as_json(data: any) -> str:
@@ -17,7 +16,7 @@ class SensorRegistry:
         return json.dumps(data, indent=2, ensure_ascii=False, default=lambda o: o.isoformat() if hasattr(o, 'isoformat') else str(o))
 
 
-    async def load_mapping(self) -> Dict[str, Dict[str, Any]]:
+    async def load_mapping(self) -> List[Sensor]:
         """
         Loads all active sensors and assignments from the database into the RAM cache.
         Optimized to bypass database queries if the cache is already initialized.
@@ -53,19 +52,18 @@ class SensorRegistry:
                     SensorRegistry._mapping_cache = {}
 
                     for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
-                        SensorRegistry._mapping_cache[ble_id] = {
-                            "sensor_db_id": sensor_db_id,
-                            "mac_address": mac_address,
-                            "location_id": location_id,
-                            "location_name": location_name,
-                            "assigned_at": assigned_at,
-                            "removed_at": removed_at,
-                            "has_data_gap": False,
-                            "last_seen_timestamp": time.monotonic()
-                        }
+                        self._mapping_cache.append(Sensor(
+                            db_id=sensor_db_id,
+                            ble_id=ble_id,
+                            mac_address=mac_address,
+                            location_name=location_name,
+                            has_data_gap=False,
+                            last_seen_timestamp=time.monotonic(),
+                            history_catchup_completed=False
+                        ))
 
-                    logging.info(f"[MAPPING] Successfully cached {len(SensorRegistry._mapping_cache)} active sensors.")
-                    logging.debug(f"[MAPPING] List of cached sensors : {SensorRegistry._read_as_json(SensorRegistry._mapping_cache)}")
+                    logging.info(f"[MAPPING] Successfully cached {len(self._mapping_cache)} active sensors.")
+                    logging.debug(f"[MAPPING] List of cached sensors : {SensorRegistry._read_as_json(self._mapping_cache)}")
 
         except Exception as e:
             logging.error(f"[MAPPING ERROR] Failed to load schema mapping from database: {e}")
@@ -74,7 +72,7 @@ class SensorRegistry:
         return SensorRegistry._mapping_cache
 
 
-    async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> SensorMetadata:
+    async def get_sensor(self, ble_id: str, mac_address: Optional[str] = None) -> Sensor:
         """
         Retrieves a sensor record from the RAM cache.
         If the device is unknown, it triggers an automated database registration
@@ -83,34 +81,34 @@ class SensorRegistry:
         async with SensorRegistry._lock_mapping:
             mapping_data = await self.load_mapping()
 
-            if ble_id not in mapping_data:
+            sensor = next((s for s in mapping_data if s.ble_id == ble_id), None)
+
+            if sensor is None:
                 logging.warning(f"[MAPPING] Unknown sensor detected ({ble_id}). Initiating auto-registration...")
                 try:
                     sensor_db_id = await self.db.insert_sensor(ble_id, mac_address)
 
-                    mapping_data[ble_id] = {
-                        "sensor_db_id": sensor_db_id,
-                        "mac_address": mac_address,
-                        "location_name": "Unknown",
-                        "has_data_gap": False,
-                        "last_seen_timestamp": time.monotonic()
-                    }
-                    logging.warning("Warning", f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
+                    mapping_data.append(Sensor(
+                        sensor_db_id=sensor_db_id,
+                        ble_id=ble_id,
+                        mac_address=mac_address or "",
+                        location_name="Unknown",
+                        has_data_gap=False,
+                        last_seen_timestamp=time.monotonic(),
+                        history_catchup_completed=False
+                    ))
+
+                    logging.warning(f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
 
                 except Exception as e:
                     logging.error(f"[MAPPING ERROR] Automated registration failed for device {ble_id}: {e}")
                     raise e
             else:
-                mapping_data[ble_id]["last_seen_timestamp"] = time.monotonic()
-                if mac_address and not mapping_data[ble_id].get("mac_address"):
-                    mapping_data[ble_id]["mac_address"] = mac_address
+                sensor.last_seen_timestamp = time.monotonic()
+                if mac_address and not sensor.mac_address:
+                    sensor.mac_address = mac_address
 
-            raw_info = mapping_data[ble_id]
-            return SensorMetadata(
-                sensor_db_id=raw_info["sensor_db_id"],
-                mac_address=raw_info.get("mac_address", ""),
-                location_name=raw_info.get("location_name", "Unknown")
-            )
+            return sensor
 
     async def evict_sensor(self, ble_id: str) -> None:
         """
@@ -120,7 +118,7 @@ class SensorRegistry:
         async with SensorRegistry._lock_mapping:
             removed = SensorRegistry._mapping_cache.pop(ble_id, None)
             if removed:
-                logging.warning(f"[MAPPING] Sensor {ble_id} (ID: {removed['sensor_db_id']}) evicted from cache.")
+                logging.warning(f"[MAPPING] Sensor {ble_id} (ID: {removed.sensor_db_id}) evicted from cache.")
 
     async def flag_data_gap(self, ble_id: str, has_gap: bool) -> None:
         """
@@ -130,10 +128,21 @@ class SensorRegistry:
             if ble_id in SensorRegistry._mapping_cache:
                 SensorRegistry._mapping_cache[ble_id]["has_data_gap"] = has_gap
 
-    async def get_all_cached_sensors(self) -> Dict[str, Dict[str, Any]]:
+    async def get_sensors(self) -> List[Sensor]:
         """
         Returns a safe shallow copy of the active sensors memory mapping cache.
         Prevents concurrent modification exceptions during asynchronous loops iterations.
         """
         async with SensorRegistry._lock_mapping:
             return SensorRegistry._mapping_cache.copy()
+    async def get_up_sensors(self) -> List[Sensor]:
+        """
+        Returns a safe shallow copy of the sensors who didn't finished their history catchup.
+        Prevents concurrent modification exceptions during asynchronous loops iterations.
+        """
+        async with self._lock_mapping:
+            output = {}
+            for ble_id, sensor in self._mapping_cache.items():
+                if not sensor.history_catchup_completed:
+                    output[ble_id] = sensor
+            return output
