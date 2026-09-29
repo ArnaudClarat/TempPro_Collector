@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 from psycopg_pool import AsyncConnectionPool
 from datetime import datetime, timezone
 
-from config import EXECUTION_MODE
+from config import EXECUTION_MODE, DB_CHUNK_SIZE, DB_INSERT_INTERVAL_SECONDS
 from models import Measure, Sensor
 
 class DatabaseBatcher:
@@ -52,36 +52,54 @@ class DatabaseBatcher:
         if not buffer:
             return
 
+        bindings_matrix = []
+        for m in buffer:
+            sensor_id = (
+                m.sensor.db_id
+                if m.sensor and getattr(m.sensor, "db_id", None) is not None
+                else m.sensor_id
+            )
+
+            if sensor_id is None:
+                logging.warning(f"[DATABASE] Integrity violation: Measure at {m.time} lacks any valid sensor reference.")
+                raise ValueError(f"Measure at {m.time} has no associated sensor ID.")
+
+            bindings_matrix.append((
+                m.time,
+                sensor_id,
+                m.temperature,
+                m.humidity_raw,
+                m.battery_raw
+            ))
+
+        # Routing logic for simulation and offline modes
+        if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT", "SENSORS_ONLY"):
+            for i in range(0, len(bindings_matrix), DB_CHUNK_SIZE):
+                chunk = bindings_matrix[i:i + DB_CHUNK_SIZE]
+                samples = [
+                    f"('{t.strftime('%Y-%m-%d %H:%M:%S')}', {s}, {temp}, {hum}, {bat})"
+                    for t, s, temp, hum, bat in bindings_matrix[:3]
+                ]
+                preview = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
+                logging.info(f"[DB MOCK] Simulated chunk {i // DB_CHUNK_SIZE + 1} ({len(chunk)} rows) preview: {preview}")
+                if i + DB_CHUNK_SIZE < len(bindings_matrix):
+                    await asyncio.sleep(DB_INSERT_INTERVAL_SECONDS)
+            return
+
         query = """
             INSERT INTO measures (time, sensor_id, temperature, humidity_raw, battery_raw)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (time, sensor_id) DO NOTHING;
         """
 
-        # Direct attribute access bypassing dictionary overhead
-        bindings_matrix = [
-            (
-                m.time,
-                sensor_id,
-                m.temperature,
-                m.humidity_raw,
-                m.battery_raw
-            )
-            for m in buffer
-        ]
-
-        # Routing logic for simulation and offline modes
-        if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT", "SENSORS_ONLY"):
-            samples = [f"('{t.strftime('%Y-%m-%d %H:%M:%S')}', {s}, {temp}, {hum}, {bat})" for t, s, temp, hum, bat in bindings_matrix[:3]]
-            preview = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
-            logging.info(f"[DB MOCK] Simulated query preview : {preview}")
-            return
-
         # Asynchronous batch flush optimized for psycopg3 pipelining
         try:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.executemany(query, bindings_matrix)
+                    for i in range(0, len(bindings_matrix), DB_CHUNK_SIZE):
+                        await cur.executemany(query, bindings_matrix)
+                        if i + DB_CHUNK_SIZE < len(bindings_matrix):
+                            await asyncio.sleep(DB_INSERT_INTERVAL_SECONDS)
             logging.info(f"[DATABASE] Successfully flushed batch of {len(buffer)} measures to measures.")
 
         except Exception as e:
