@@ -139,7 +139,7 @@ async def main() -> int:
         return 1
 
     db = DatabaseBatcher()
-    await db.init_db()
+    await db.get_sensor()
 
     try:
         for target_csv in csv_files:

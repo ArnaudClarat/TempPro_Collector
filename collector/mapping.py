@@ -26,6 +26,7 @@ class SensorRegistry:
 
         if self.db.pool is None:
             logging.warning("[MAPPING] Database pool uninitialized, skipping cache load.")
+            await self.db.get_conn()
             return {}
 
         try:

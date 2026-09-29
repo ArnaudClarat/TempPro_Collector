@@ -85,7 +85,7 @@ async def main():
 
     # Initialize data infrastructure according to selected execution criteria
     if EXECUTION_MODE != "OFFLINE_SIMULATION":
-        await database_batcher.init_db()
+        await database_batcher.get_conn()
         await sensor_registry.load_mapping()
 
         measure_parser.database_queue = database_batcher.db_queue

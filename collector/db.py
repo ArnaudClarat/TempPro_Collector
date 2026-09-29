@@ -78,9 +78,9 @@ class DatabaseBatcher:
                 chunk = bindings_matrix[i:i + DB_CHUNK_SIZE]
                 samples = [
                     f"('{t.strftime('%Y-%m-%d %H:%M:%S')}', {s}, {temp}, {hum}, {bat})"
-                    for t, s, temp, hum, bat in bindings_matrix[:3]
+                    for t, s, temp, hum, bat in chunk[:3]
                 ]
-                preview = ", ".join(samples) + (f", ... (+ {len(bindings_matrix) - 3} rows)" if len(bindings_matrix) > 3 else "")
+                preview = ", ".join(samples) + (f", ... (+ {len(chunk) - 3} rows)" if len(chunk) > 3 else "")
                 logging.info(f"[DB MOCK] Simulated chunk {i // DB_CHUNK_SIZE + 1} ({len(chunk)} rows) preview: {preview}")
                 if i + DB_CHUNK_SIZE < len(bindings_matrix):
                     await asyncio.sleep(DB_INSERT_INTERVAL_SECONDS)
@@ -106,7 +106,7 @@ class DatabaseBatcher:
             logging.error(f"[DATABASE] Batch measurement insertion sequence failed: {e}")
             raise e
 
-    async def insert_sensor(self, ble_id: str, mac_address: str) -> int:
+    async def insert_sensor(self, sensor: Sensor) -> None:
         """
         Registers a newly discovered hardware sensor, or simulates the registration
         depending on the active execution mode rules.
@@ -117,7 +117,7 @@ class DatabaseBatcher:
             ON CONFLICT (ble_id) DO UPDATE SET mac_address = EXCLUDED.mac_address
             RETURNING id;
         """
-        bindings = (ble_id, mac_address)
+        bindings = (sensor.ble_id, sensor.mac_address)
 
         # Routing logic for simulation and partial tracking modes
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
