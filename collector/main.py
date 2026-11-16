@@ -7,9 +7,10 @@ from typing import Optional
 
 from config import EXECUTION_MODE, CURRENT_LOG_LEVEL
 from decoder import MeasureParser
-from db import DatabaseBatcher
+from db import Database
 from mapping import SensorRegistry
 from watchdog import Watchdog
+from buckets import BucketsManager
 
 logging.basicConfig(
     level=CURRENT_LOG_LEVEL,
@@ -19,10 +20,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("collector")
 
-database_batcher = DatabaseBatcher()
-sensor_registry = SensorRegistry(database_batcher)
+database = Database()
+sensor_registry = SensorRegistry(database)
 measure_parser = MeasureParser(sensor_registry)
-watchdog = Watchdog(database_batcher, sensor_registry)
+watchdog = Watchdog(database, sensor_registry)
+buckets_manager = BucketsManager()
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -42,6 +44,7 @@ class BleScanner:
         # Extract manufacturer payload (skip empty background advertisements safely)
         for manufacturer_id, payload in advertisement_data.manufacturer_data.items():
             arrival_time = datetime.now(timezone.utc)
+            arrival_monotonic = time.monotonic()
 
             # Robust ID extraction: use MAC address suffix if name split fails
             ble_id = device.name.split("(")[-1].replace(")", "")
@@ -50,7 +53,7 @@ class BleScanner:
             if EXECUTION_MODE == "OFFLINE_SIMULATION":
                 # Direct streaming to stdout for standalone local validation
                 decoded = measure_parser.decode_tp357(manufacturer_id, payload)
-                looger.info(f"[OFFLINE TEST] Sensor: {ble_id} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity_raw']}%")
+                logger.info(f"[OFFLINE TEST] Sensor: {ble_id} | Temp: {decoded['temperature']}°C | Hum: {decoded['humidity']}%")
             else:
                 # Production pipeline: forward raw packet to the async decoder queue
                 packet = {
@@ -58,7 +61,8 @@ class BleScanner:
                     "manufacturer_id": manufacturer_id,
                     "mac_address": mac_address,
                     "payload": payload,
-                    "time": arrival_time
+                    "time": arrival_time,
+                    "monotonic_time": arrival_monotonic
                 }
                 logger.info(f"[CALLBACK] Verified packet captured for sensor: {ble_id} -> Pushing to decoder queue.")
                 measure_parser.raw_data_queue.put_nowait(packet)
@@ -87,13 +91,19 @@ async def main():
 
     # Initialize data infrastructure according to selected execution criteria
     if EXECUTION_MODE != "OFFLINE_SIMULATION":
-        await database_batcher.get_conn()
+        database.registry = sensor_registry
+
+        await database.get_conn()
         await sensor_registry.load_mapping()
 
-        measure_parser.database_queue = database_batcher.db_queue
+        measure_parser.buckets_manager = buckets_manager
+        measure_parser.database_queue = database.db_queue
+        watchdog.database_queue = database.db_queue
+        measure_parser.buckets_manager.database_queue = database.db_queue
+        measure_parser.buckets_manager.on_catchup_needed = watchdog.follow_up_history
 
         # Concurrently fire pipeline background processing threads
-        db_worker_task = asyncio.create_task(database_batcher.db_worker())
+        db_worker_task = asyncio.create_task(database.db_worker())
         decoder_task = asyncio.create_task(measure_parser.decoder_loop())
         watchdog_task = asyncio.create_task(watchdog.start_worker())
 
@@ -143,7 +153,7 @@ async def main():
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
         if EXECUTION_MODE != "OFFLINE_SIMULATION":
-            await database_batcher.close_db()
+            await database.close_db()
         logger.info("Subsystems terminated cleanly.")
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ class SensorRegistry:
         if self.db.pool is None:
             logging.warning("[MAPPING] Database pool uninitialized, skipping cache load.")
             await self.db.get_conn()
-            return {}
+            return []
 
         try:
             async with self.db.pool.connection() as conn:
@@ -36,7 +36,7 @@ class SensorRegistry:
                         """
                         SELECT
                             s.ble_id,
-                            s.id AS sensor_db_id,
+                            s.id AS db_id,
                             s.mac_address AS mac_address,
                             l.id AS location_id,
                             l.name AS location_name,
@@ -52,14 +52,14 @@ class SensorRegistry:
 
                     self._mapping_cache = []
 
-                    for ble_id, sensor_db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
+                    for ble_id, db_id, mac_address, location_id, location_name, assigned_at, removed_at in rows:
                         self._mapping_cache.append(Sensor(
-                            db_id=sensor_db_id,
+                            db_id=db_id,
                             ble_id=ble_id,
                             mac_address=mac_address,
                             location_name=location_name,
                             has_data_gap=False,
-                            last_seen_timestamp=time.monotonic(),
+                            last_ble_received_monotonic=None,
                             history_catchup_completed=False
                         ))
 
@@ -69,9 +69,7 @@ class SensorRegistry:
         except Exception as e:
             logging.error(f"[MAPPING ERROR] Failed to load schema mapping from database: {e}")
             raise e
-        print(self._mapping_cache)
         return self._mapping_cache
-
 
     async def get_sensor(self, ble_id: str, mac_address: str | None = None) -> Sensor:
         """
@@ -79,49 +77,47 @@ class SensorRegistry:
         If the device is unknown, it triggers an automated database registration
         and updates the memory cache dynamically for subsequent lookups.
         """
+
         async with self._lock_mapping:
             mapping_data = await self.load_mapping()
-
             sensor = next((s for s in mapping_data if s.ble_id == ble_id), None)
-            print(f"ble_id : {ble_id} | mac : {mac_address} | sensor : {sensor}")
-            if sensor is None and mac_address is not None:
+
+            if sensor is not None:
+                if mac_address and not sensor.mac_address:
+                    sensor.mac_address = mac_address
+
+            elif mac_address is not None:
                 logging.warning(f"[MAPPING] Unknown sensor detected ({ble_id}). Initiating auto-registration...")
                 try:
                     sensor = Sensor(ble_id=ble_id, mac_address=mac_address)
-                    sensor_db_id = await self.db.insert_sensor(sensor)
+                    db_id = await self.db.insert_sensor(sensor)
 
-                    mapping_data.append(Sensor(
-                        sensor_db_id=sensor_db_id,
+                    sensor = Sensor(
+                        db_id=db_id,
                         ble_id=ble_id,
                         mac_address=mac_address or "",
                         location_name="Unknown",
                         has_data_gap=False,
-                        last_seen_timestamp=time.monotonic(),
+                        last_ble_received_monotonic=None,
                         history_catchup_completed=False
-                    ))
+                    )
+                    mapping_data.append(sensor)
 
-                    logging.warning(f"[MAPPING] Sensor {ble_id} registered with internal database ID: {sensor_db_id}")
+                    logging.warning(f"[MAPPING] Sensor {ble_id} registered with internal database ID: {db_id}")
 
                 except Exception as e:
                     logging.error(f"[MAPPING] Automated registration failed for device {ble_id}: {e}")
                     raise e
-            elif mac_address is None:
-                raise ValueError(f"[MAPPING] No mac_address given")
             else:
-                if mac_address and not sensor.mac_address:
-                    sensor.mac_address = mac_address
+                raise ValueError(f"[MAPPING] No mac_address given")
 
             return sensor
 
-    async def evict_sensor(self, ble_id: str) -> None:
-        """
-        Removes a sensor from the RAM cache instantly.
-        Typically invoked by the Watchdog routine upon permanent connection failure.
-        """
+    async def evict_sensor(self, sensor: Sensor) -> None:
         async with self._lock_mapping:
-            removed = self._mapping_cache.remove(ble_id)
-            if removed:
-                logging.warning(f"[MAPPING] Sensor {ble_id} (ID: {removed.sensor_db_id}) evicted from cache.")
+            if sensor in self._mapping_cache:
+                self._mapping_cache.remove(sensor)
+                logging.warning(f"[MAPPING] Sensor {sensor.ble_id} (ID: {sensor.db_id}) evicted from cache.")
 
     async def toggle_data_gap(self, sensor: Sensor) -> None:
         """
@@ -145,8 +141,4 @@ class SensorRegistry:
         Prevents concurrent modification exceptions during asynchronous loops iterations.
         """
         async with self._lock_mapping:
-            output = {}
-            for ble_id, sensor in self._mapping_cache.items():
-                if not sensor.history_catchup_completed:
-                    output[ble_id] = sensor
-            return output
+            return [s for s in self._mapping_cache if not s.history_catchup_completed]

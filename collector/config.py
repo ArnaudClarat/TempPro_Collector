@@ -7,6 +7,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 # Application Execution Settings
 EXECUTION_MODE = os.getenv("APP_EXECUTION_MODE", "OFFLINE_SIMULATION").upper()
+LOCAL_TZ_NAME = os.environ.pop("TZ", None)
 
 # Logging Infrastructure Configurations
 CURRENT_LOG_LEVEL = logging.getLevelName(os.getenv("APP_LOG_LEVEL", "INFO").upper())

@@ -1,31 +1,34 @@
 import os, time, asyncio, logging
 from typing import List, Dict, Any, Optional
 from psycopg_pool import AsyncConnectionPool
+from psycopg import AsyncConnection, Error
 from datetime import datetime, timezone
 
 from config import EXECUTION_MODE, DB_CHUNK_SIZE, DB_INSERT_INTERVAL_SECONDS
 from models import Measure, Sensor
 
-class DatabaseBatcher:
+class Database:
     def __init__(self):
-        self.db_queue: Optional[asyncio.Queue] = None
+        self.db_queue: [asyncio.Queue] = asyncio.Queue()
         self.pool: Optional[AsyncConnectionPool] = None
+        self.registry = None
 
-    async def get_conn(self) -> None:
-        if self.pool is None or self.pool.closed:
-            logging.error("[DATABASE] Pool was lost or closed. Re-establishing connection...")
-            await self._init_db()
+    async def get_conn(self) -> AsyncConnection:
+        if self.pool is not None:
+            if not self.pool.closed:
+                return self.pool.connection()
+            else:
+                logging.error("[DATABASE] Pool was lost or closed. Re-establishing connection...")
+        await self._init_db() 
         return self.pool.connection()
 
     async def _init_db(self) -> None:
         """
         Initializes the asynchronous PostgreSQL connection pool if required by the execution mode.
         """
-        self.db_queue = asyncio.Queue()
         if EXECUTION_MODE == "OFFLINE_SIMULATION":
             logging.info("[DATABASE] OFFLINE_SIMULATION active. Bypassing connection pool initialization.")
             return
-
 
         user = os.getenv("PG_USER")
         password = os.getenv("PG_PASSWORD")
@@ -41,6 +44,12 @@ class DatabaseBatcher:
         await self.pool.wait()
         logging.info(f"[DATABASE] Connected to TimescaleDB pool in [{EXECUTION_MODE}] mode.")
 
+        try:
+            await self.registry.load_mapping()
+            logging.info("[DATABASE] Sensor mapping cache successfully reloaded after DB connection/reconnection.")
+        except Exception as e:
+            logging.error(f"[DATABASE] Failed to reload sensor mapping cache after DB connection: {e}")
+
     async def close_db(self) -> None:
         """
         Gracefully terminates the global database connection pool.
@@ -50,7 +59,7 @@ class DatabaseBatcher:
             self.pool = None
             logging.info("[DATABASE] Connection pool closed successfully.")
 
-    async def insert_measures(self, buffer: List[Measure]) -> None:
+    async def _insert_measures(self, buffer: List[Measure]) -> None:
         """
         Inserts a batch of Measure objects into the database, or simulates
         the insertion depending on the APP_EXECUTION_MODE value.
@@ -74,7 +83,7 @@ class DatabaseBatcher:
                 m.time,
                 sensor_id,
                 m.temperature,
-                m.humidity_raw,
+                m.humidity,
                 m.battery_raw
             ))
 
@@ -93,7 +102,7 @@ class DatabaseBatcher:
             return
 
         query = """
-            INSERT INTO measures (time, sensor_id, temperature, humidity_raw, battery_raw)
+            INSERT INTO measures (time, sensor_id, temperature, humidity, battery_raw)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (time, sensor_id) DO NOTHING;
         """
@@ -103,7 +112,7 @@ class DatabaseBatcher:
             async with self.pool.connection() as conn:
                 async with conn.cursor() as cur:
                     for i in range(0, len(bindings_matrix), DB_CHUNK_SIZE):
-                        await cur.executemany(query, bindings_matrix)
+                        await cur.executemany(query, bindings_matrix[i:i + DB_CHUNK_SIZE])
                         if i + DB_CHUNK_SIZE < len(bindings_matrix):
                             await asyncio.sleep(DB_INSERT_INTERVAL_SECONDS)
             logging.info(f"[DATABASE] Successfully flushed batch of {len(buffer)} measures to measures.")
@@ -127,7 +136,9 @@ class DatabaseBatcher:
 
         # Routing logic for simulation and partial tracking modes
         if EXECUTION_MODE in ("OFFLINE_SIMULATION", "MOCK_INSERT"):
-            logging.info(f"[DB MOCK] Time: {buffer[0]['time'].strftime('%H:%M:%S')} | Executing aggregated insert")
+            mock_query = query.strip()
+            for b in bindings: mock_query = mock_query.replace("%s", repr(b), 1)
+            logging.info(f"[DB MOCK] Executing {mock_query}") #Remplace query par la query en remplacant les %s par les bindings.
             return int(time.time()) & 0xFFFF
 
         try:
@@ -136,7 +147,7 @@ class DatabaseBatcher:
                     await cur.execute(query, bindings)
                     sensor_id = (await cur.fetchone())[0]
 
-            logging.info(f"[DATABASE Info] Registered new hardware signature {ble_id} with database reference ID: {sensor_id}")
+            logging.info(f"[DATABASE Info] Registered new hardware signature {sensor.ble_id} with database reference ID: {sensor_id}")
             return sensor_id
         except Exception as e:
             logging.info(f"[DATABASE ERROR] Critical sensor hardware registration sequence aborted: {e}")
@@ -194,7 +205,7 @@ class DatabaseBatcher:
                                 ble_id=ble_id,
                                 mac_address=mac_address,
                                 location_name=None,
-                                last_seen_timestamp=last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time,
+                                history_cursor_timestamp=last_time.replace(tzinfo=timezone.utc) if last_time.tzinfo is None else last_time,
                                 has_data_gap=False,
                                 history_catchup_completed=False
                             )) 
@@ -206,76 +217,51 @@ class DatabaseBatcher:
     async def db_worker(self) -> None:
         """
         Continuous consumer background routine driving the centralized ingestion funnel (Queue 2).
+        Pulls pre-packaged batches of measures from the queue and flushes them safely into TimescaleDB.
         """
         logging.info("[DATABASE] Ingestion funnel background pipeline worker initializing.")
-        from datetime import timedelta
-        from models import Measure
-
-        buffer: List[Measure] = []
-        minute_accumulator: Dict[str, Dict[str, List[float]]] = {}
-        current_minute = datetime.now(timezone.utc).minute
 
         try:
             while True:
                 try:
                     # Non-blocking pull from ingestion queue with a 1-second heartbeat timeout
                     logging.debug(f"[DB WORKER] Listening to queue ID: {id(self.db_queue)} | Current size: {self.db_queue.qsize()}")
-                    data = await asyncio.wait_for(self.db_queue.get(), timeout=1.0)
-                    self.db_queue.task_done()
+                    batch = await asyncio.wait_for(self.db_queue.get(), timeout=1.0)
+                    
+                    try:
+                        # Insertion directe du lot de mesures préparé par le décodeur
+                        await self._insert_measures(batch)
+
+                    except Error as sql_err:
+                        logging.error(f"[DB WORKER] SqlException: {sql_err}")
+
+                    except Exception as e:
+                        logging.error("[DB WORKER] An internal error occurred.")
+                        raise e
+                    finally:
+                        self.db_queue.task_done()
+                        
                 except asyncio.TimeoutError:
-                    # Timeout is expected; allows the loop to evaluate the chronological minute trigger below
-                    data = None
+                    # Timeout normal de la queue, permet de boucler proprement
+                    continue
 
-                if data:
-                    ble_id = data.ble_id
+        except asyncio.CancelledError as ce:
+            logging.info("[DATABASE] System shutdown signal intercepted. Draining queue before offline...")
+            while not self.db_queue.empty():
+                try:
+                    batch = self.db_queue.get_nowait()
+                    await self._insert_measures(batch)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self.db_queue.task_done()
+                    except ValueError:
+                        pass
+            logging.info("[DATABASE] Ingestion worker offline.")
+            raise ce
 
-                    # Dynamically provision sub-arrays if encountering a sensor for the first time during the current window
-                    if ble_id not in minute_accumulator:
-                        minute_accumulator[ble_id] = {"temps": [], "hums": [], "bats": [], "db_id": data.sensor_id}
-
-                    minute_accumulator[ble_id]["temps"].append(data.temperature)
-                    minute_accumulator[ble_id]["hums"].append(data.humidity_raw)
-                    minute_accumulator[ble_id]["bats"].append(data.battery_raw)
-
-                # Absolute trigger condition: time reaches the 00-second mark of a new minute
-                now_dt = datetime.now(timezone.utc)
-                if now_dt.minute != current_minute:
-                    if minute_accumulator:
-                        from main import sensor_registry
-                        buffer = []
-
-                        for ble_id, metrics in minute_accumulator.items():
-                            if not metrics["temps"]: # Defensive guard against zero-division errors
-                                continue
-
-                            # Execute arithmetic mean calculations rounded to standard decimals
-                            avg_temp = round(sum(metrics["temps"]) / len(metrics["temps"]), 2)
-                            avg_hum = round(sum(metrics["hums"]) / len(metrics["hums"]), 2)
-                            avg_bat = round(sum(metrics["bats"]) / len(metrics["bats"]), 2)
-                            sensor_info = await sensor_registry.get_sensor(ble_id)
-
-                            # Instantiating the typed dataclass object directly inside the buffer
-                            buffer.append(Measure(
-                                ble_id=ble_id,
-                                sensor_id=sensor_info.sensor_db_id,
-                                temperature=avg_temp,
-                                humidity_raw=avg_hum,
-                                battery_raw=int(avg_bat),
-                                time=(now_dt.replace(second=0, microsecond=0) - timedelta(minutes=1)) # Force-truncate metrics timestamp to minute-precision for optimal hypertable bucket alignments
-                            ))
-                        if buffer:
-                            await self.insert_measures(buffer)
-
-                        minute_accumulator.clear()
-
-                    current_minute = now_dt.minute
-
-        except asyncio.CancelledError:
-            if buffer:
-                logging.info(f"[DATABASE] System shutdown signal intercepted. Initiating final data flush of {len(buffer)} measures...")
-                await self.insert_measures(buffer)
-            logging.info("[DATABASE] Ingestion funnel worker offline.")
-            raise
         except Exception as e:
-            logging.error(f"[DATABASE] Funnel worker pipeline crashed: {e}")
+            logging.error(f"[DB WORKER FATAL] Unexpected queue loop error: {e}")
+            raise e
 

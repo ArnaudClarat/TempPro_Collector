@@ -33,7 +33,7 @@ CREATE TABLE public.measures (
     time TIMESTAMP WITH TIME ZONE NOT NULL,
     sensor_id INT NOT NULL REFERENCES public.sensors(id) ON DELETE CASCADE,
     temperature NUMERIC(4, 2) NOT NULL,
-    humidity_raw INT NOT NULL,
+    humidity INT NOT NULL,
     battery_raw INT DEFAULT NULL,
     PRIMARY KEY (time, sensor_id)
 );

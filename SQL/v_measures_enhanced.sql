@@ -6,10 +6,10 @@ WITH base_data AS (
         s.ble_id,
         l.name AS location_name,
         m.temperature,
-        m.humidity_raw AS humidity,
+        m.humidity AS humidity,
         m.battery_raw AS battery,
         6.112::double precision * exp(17.67::double precision * m.temperature / (m.temperature + 243.5::double precision)) AS es,
-        m.humidity_raw::double precision / 100.0::double precision AS rh_ratio,
+        m.humidity::double precision / 100.0::double precision AS rh_ratio,
         -- Inertie thermique : Moyenne glissante de la température extérieure sur 12h
         ext.temp_ext_smoothed AS temp_ext
     FROM measures m
